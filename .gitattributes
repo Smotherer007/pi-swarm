@@ -1,0 +1,5 @@
+# Deterministic line endings on every platform: the test suite reads its own
+# files (skill frontmatter, workflows) and compares them byte for byte.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

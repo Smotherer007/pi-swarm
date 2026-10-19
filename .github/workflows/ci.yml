@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The whole feature matrix on Linux, and the two other operating
+          # systems on the oldest supported Node: peers do not care which OS
+          # the other agent runs on, so the extension must not either.
+          - os: ubuntu-latest
+            node: 22
+          - os: ubuntu-latest
+            node: 24
+          - os: ubuntu-latest
+            node: 26
+          - os: macos-latest
+            node: 22
+          - os: windows-latest
+            node: 22
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
