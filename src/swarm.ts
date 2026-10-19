@@ -931,10 +931,20 @@ export class SwarmNode {
   ): Promise<ConnectAttempt> {
     const existing = peer.nodeId ? this.connections.get(peer.nodeId) : undefined;
     if (existing && existing.outToken) {
-      // A stored link can outlive the peer: it was restarted, moved, or shut
-      // down. Claiming "already connected" for a link that cannot send is worse
-      // than a fresh handshake, so the peer is asked whether it still answers.
-      if (await this.isReachable(existing)) {
+      // Asking for scopes the link does not hold needs a new handshake: the
+      // grant lives in the token, so "already connected" would look like success
+      // while quietly keeping the old, narrower grant.
+      const missing = normalizeScopes(options.scopes ?? []).filter(
+        (scope) => !hasScope(existing.grantedToMe, scope),
+      );
+      if (missing.length > 0) {
+        // Only our own half is reset; whatever we granted the peer stays.
+        this.invalidateOutbound(existing, "renegotiating for wider scopes");
+      } else if (await this.isReachable(existing)) {
+        // A stored link can outlive the peer: it was restarted, moved, or shut
+        // down. Claiming "already connected" for a link that cannot send is
+        // worse than a fresh handshake, so the peer is asked whether it still
+        // answers.
         existing.lastSeen = Date.now();
         return {
           peer: { nodeId: existing.nodeId, name: existing.name, host: existing.host, port: existing.port },
@@ -943,8 +953,9 @@ export class SwarmNode {
           sessionId: existing.sessionId,
           reason: "already connected",
         };
+      } else {
+        this.dropConnection(existing.nodeId, "no answer from the peer");
       }
-      this.dropConnection(existing.nodeId, "no answer from the peer");
     }
 
     // A retry must resume the request that is already queued on the peer, not

@@ -804,3 +804,73 @@ describe("resetting the token a peer holds", () => {
     assert.deepEqual(events, []);
   });
 });
+
+describe("asking for wider scopes on a live link", () => {
+  it("renegotiates instead of answering 'already connected'", async () => {
+    const root = tempDir("pi-swarm-uprgade");
+    dirs.push(root);
+    const host = new SwarmNode({
+      config: makeConfig({ name: "uphost", inboundPolicy: "known-auto", defaultScopes: ["chat", "knowledge:read", "knowledge:write"] }),
+      identity: makeIdentity("uphost"),
+      peersPath: path.join(root, "peers.json"),
+      sessionsDir: path.join(root, "sessions"),
+      instanceDir: null,
+      discovery: false,
+    });
+    nodes.push(host);
+    const guest = makeNode("upguest");
+    const h = await host.start();
+    await guest.start();
+
+    host.peers.touch(
+      { nodeId: "n_test_upguest", name: "upguest", host: "127.0.0.1", port: 1 },
+      { trusted: true, scopes: ["chat", "knowledge:read", "knowledge:write"] },
+    );
+
+    const first = await guest.connect(`127.0.0.1:${h.port}`, { scopes: ["chat"], wait: true, timeoutMs: 10_000 });
+    assert.equal(first.status, "connected");
+    assert.deepEqual(first.scopes, ["chat"]);
+
+    // Same link, wider request: this must negotiate again, not report success
+    // with the narrower grant it already has.
+    const second = await guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat", "knowledge:write"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    assert.equal(second.status, "connected");
+    assert.notEqual(second.reason, "already connected");
+    assert.deepEqual(second.scopes, ["chat", "knowledge:write"]);
+
+    await guest.stop();
+    await host.stop();
+  });
+
+  it("still answers 'already connected' when nothing new is asked", async () => {
+    const root = tempDir("pi-swarm-same");
+    dirs.push(root);
+    const host = new SwarmNode({
+      config: makeConfig({ name: "samehost", inboundPolicy: "known-auto" }),
+      identity: makeIdentity("samehost"),
+      peersPath: path.join(root, "peers.json"),
+      sessionsDir: path.join(root, "sessions"),
+      instanceDir: null,
+      discovery: false,
+    });
+    nodes.push(host);
+    const guest = makeNode("sameguest");
+    const h = await host.start();
+    await guest.start();
+
+    const first = guest.connect(`127.0.0.1:${h.port}`, { scopes: ["chat"], wait: true, timeoutMs: 10_000 });
+    await waitFor(() => host.pendingRequests().length === 1);
+    host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
+    assert.equal((await first).status, "connected");
+
+    const again = await guest.connect(`127.0.0.1:${h.port}`, { scopes: ["chat"], wait: true, timeoutMs: 5_000 });
+    assert.equal(again.reason, "already connected");
+
+    await guest.stop();
+    await host.stop();
+  });
+});
