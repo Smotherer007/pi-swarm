@@ -42,6 +42,7 @@ import {
   API_PREFIX,
   DEFAULT_PORT,
   MAX_KNOWLEDGE_ENTRIES_PER_PUSH,
+  MIN_FREE_DISK_BYTES,
   MAX_PENDING_REQUESTS,
   MAX_TEXT_LENGTH,
   PEER_STALE_MS,
@@ -70,8 +71,13 @@ import {
   sanitizeText,
 } from "./protocol.ts";
 import { Discovery, pidAlive } from "./discovery.ts";
+import { displayName, FileStore, newOfferId } from "./files.ts";
+import type { IncomingOffer } from "./files.ts";
+import * as crypto from "node:crypto";
+
 import {
   baseUrl,
+  downloadToFile,
   requestJson,
   sendJson,
   startHttpServer,
@@ -79,12 +85,14 @@ import {
 } from "./transport.ts";
 import type { HttpServerHandle } from "./transport.ts";
 import {
+  filesDir,
   identityFilePath,
   instanceDir,
   instanceSlug,
   peersFilePath,
   sanitizeSegment,
   sessionsDir,
+  swarmDir,
 } from "./paths.ts";
 
 export type SwarmEvent =
@@ -92,6 +100,7 @@ export type SwarmEvent =
   | { type: "connected"; connection: Connection }
   | { type: "message"; message: SwarmMessage }
   | { type: "knowledge"; entries: KnowledgeEntry[]; from: Connection }
+  | { type: "file-offer"; offer: IncomingOffer }
   | { type: "invitation"; peer: DiscoveredPeer; invitation: string }
   | { type: "disconnected"; nodeId: string; name: string; reason: string };
 
@@ -103,6 +112,8 @@ export interface SwarmNodeOptions {
   peersPath?: string;
   sessionsDir?: string;
   instanceDir?: string | null;
+  /** Where received files live. Overrides the path from paths.ts (tests). */
+  filesPath?: string;
   /** Force discovery off/on regardless of the config. */
   discovery?: boolean;
   discoveryPort?: number;
@@ -198,6 +209,7 @@ export class SwarmNode {
   private outgoing = new Map<string, { peer: PeerRef; sessionId: string | null }>();
   private inbox: SwarmMessage[] = [];
   private knowledge: KnowledgeBase | null = null;
+  private readonly files: FileStore;
   private sessionId: string | null = null;
   private startedAt: number | null = null;
   private running = false;
@@ -234,6 +246,9 @@ export class SwarmNode {
         filePath: this.peersPath,
         defaultScopes: this.config.defaultScopes,
       });
+
+    this.files = new FileStore({ root: options.filesPath ?? filesDir() });
+    this.files.load(this.fileIndexPath());
   }
 
   get isRunning(): boolean {
@@ -250,6 +265,10 @@ export class SwarmNode {
 
   get knowledgeBase(): KnowledgeBase | null {
     return this.knowledge;
+  }
+
+  get fileStore(): FileStore {
+    return this.files;
   }
 
   // ---------------------------------------------------------------- lifecycle
@@ -1252,6 +1271,12 @@ export class SwarmNode {
     return true;
   }
 
+  /** Forget everything a peer sent or was offered. */
+  purgePeerFiles(nodeId: string): void {
+    const purged = this.files.purgePeer(nodeId);
+    if (purged.files > 0 || purged.offers > 0) this.files.persist(this.fileIndexPath());
+  }
+
   private dropConnection(nodeId: string, reason: string): void {
     const connection = this.connections.get(nodeId);
     if (!connection) return;
@@ -1335,6 +1360,103 @@ export class SwarmNode {
 
       if (method === "POST" && route === `${API_PREFIX}/approval`) {
         this.handleApprovalRequest(body, res);
+        return;
+      }
+
+      if (method === "POST" && route === `${API_PREFIX}/files/offer`) {
+        const connection = this.authorize(req);
+        if (!connection) {
+          sendJson(res, 401, { error: "unknown or expired token" });
+          return;
+        }
+        if (!hasScope(connection.grantedToPeer, "files:write")) {
+          sendJson(res, 403, { error: "this connection was not granted the files:write scope" });
+          return;
+        }
+        let parsed: { offerId?: unknown; name?: unknown; size?: unknown; sha256?: unknown };
+        try {
+          parsed = JSON.parse(body.toString("utf-8") || "{}") as typeof parsed;
+        } catch {
+          sendJson(res, 400, { error: "the offer is not valid JSON" });
+          return;
+        }
+        const size = Number(parsed.size);
+        const sha256 = String(parsed.sha256 ?? "");
+        if (!Number.isInteger(size) || size < 0 || size > this.config.filesMaxBytes) {
+          sendJson(res, 413, {
+            error: `the offer is ${size} bytes; this node accepts files up to ${this.config.filesMaxBytes}`,
+          });
+          return;
+        }
+        if (!/^[a-f0-9]{64}$/.test(sha256)) {
+          sendJson(res, 400, { error: "the offer must carry the sha256 of the file" });
+          return;
+        }
+        if (this.files.overQuota(connection.nodeId, size)) {
+          sendJson(res, 429, { error: "the quota for this peer is used up" });
+          return;
+        }
+
+        const policy = this.config.filesPolicy;
+        if (policy === "deny") {
+          sendJson(res, 403, { error: "this node does not accept files" });
+          return;
+        }
+
+        const offer = this.files.addIncoming({
+          offerId: typeof parsed.offerId === "string" && parsed.offerId ? parsed.offerId : newOfferId(),
+          from: { nodeId: connection.nodeId, name: connection.name, host: connection.host, port: connection.port },
+          displayName: displayName(parsed.name),
+          size,
+          sha256,
+        });
+        this.emit({ type: "file-offer", offer });
+        if (policy === "auto") {
+          // Consent was given by configuration, so the bytes are collected
+          // without a further step. If the sender never granted files:read the
+          // pull fails and the offer stays pending for a manual accept.
+          void this.acceptFile(offer.offerId).catch(() => {
+            /* the offer stays pending */
+          });
+        }
+        sendJson(res, 200, {
+          status: policy === "auto" ? "accepted" : "pending",
+          offerId: offer.offerId,
+          reason: policy === "auto" ? "this node accepts files automatically" : "waiting for a decision",
+        });
+        return;
+      }
+
+      if (method === "GET" && route.startsWith(`${API_PREFIX}/files/`)) {
+        const connection = this.authorize(req);
+        if (!connection) {
+          sendJson(res, 401, { error: "unknown or expired token" });
+          return;
+        }
+        if (!hasScope(connection.grantedToPeer, "files:read")) {
+          sendJson(res, 403, { error: "this connection was not granted the files:read scope" });
+          return;
+        }
+        const offerId = route.slice(`${API_PREFIX}/files/`.length);
+        const offer = this.files.takeOutgoing(offerId);
+        if ("error" in offer) {
+          sendJson(res, 404, { error: offer.error });
+          return;
+        }
+        let bytes: Buffer;
+        try {
+          bytes = fs.readFileSync(offer.sourcePath);
+        } catch {
+          sendJson(res, 410, { error: "the offered file is no longer readable on this node" });
+          return;
+        }
+        res.writeHead(200, {
+          "content-type": "application/octet-stream",
+          "content-length": String(bytes.length),
+          "x-swarm-name": encodeURIComponent(offer.displayName),
+          "x-swarm-sha256": offer.sha256,
+        });
+        res.end(bytes);
         return;
       }
 
@@ -1759,6 +1881,194 @@ export class SwarmNode {
     return request;
   }
 
+  /** Refuse a transfer when the disk is nearly full instead of filling it. */
+  private assertDiskSpace(): void {
+    try {
+      const stat = fs.statfsSync(this.files.fileStoreRootPath());
+      const free = Number(stat.bavail) * Number(stat.bsize);
+      if (Number.isFinite(free) && free < MIN_FREE_DISK_BYTES) {
+        throw new Error(
+          `Refusing the transfer: only ${Math.round(free / (1024 * 1024))} MB free where files are stored.`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("Refusing the transfer")) throw err;
+      /* an unsupported statfs on this platform must not block transfers */
+    }
+  }
+
+  private fileIndexPath(): string {
+    return path.join(this.files.fileStoreRootPath(), "index.json");
+  }
+
+  // -------------------------------------------------------------- file offers
+
+  /**
+   * Offer one local file to a peer.
+   *
+   * Nothing is copied here: the receiver pulls the bytes later, which is what
+   * keeps a half-written file from ever existing on the receiving side.
+   */
+  async offerFile(
+    target: string,
+    filePath: string,
+    options: { expiresInSeconds?: number } = {},
+  ): Promise<{ offerId: string; status: string; reason: string; peer: string; size: number; sha256: string }> {
+    await this.ensureStarted();
+    this.ensureSession();
+
+    const peer = this.resolvePeer(target);
+    if (!peer) throw new Error(`No peer matches "${target}".`);
+    const connection = peer.nodeId ? this.connections.get(peer.nodeId) : undefined;
+    if (!connection || !connection.outToken) {
+      throw new Error(`"${target}" is not connected, so a file cannot be offered to it.`);
+    }
+    if (!hasScope(connection.grantedToMe, "files:write")) {
+      throw new Error(
+        `${connection.name} did not grant this node the files:write scope. Use swarm_connect scopes=[...,"files:write"] to negotiate it.`,
+      );
+    }
+
+    const absolute = path.resolve(filePath);
+    const stat = fs.statSync(absolute);
+    if (!stat.isFile()) throw new Error(`"${filePath}" is not a file.`);
+    if (stat.size > this.config.filesMaxBytes) {
+      throw new Error(
+        `"${filePath}" is ${stat.size} bytes; this node only offers files up to ${this.config.filesMaxBytes} bytes.`,
+      );
+    }
+    const bytes = fs.readFileSync(absolute);
+    const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+    const offerId = newOfferId();
+    const sentName = path.basename(absolute);
+
+    const response = await requestJson<{ status?: unknown; offerId?: unknown; reason?: unknown }>(
+      `${baseUrl(connection.host, connection.port)}${API_PREFIX}/files/offer`,
+      {
+        body: { offerId, name: sentName, size: bytes.length, sha256 },
+        token: connection.outToken,
+        timeoutMs: 8000,
+      },
+    );
+
+    const status = typeof response.data?.status === "string" ? response.data.status : "unknown";
+    if (status === "declined") {
+      return {
+        offerId: "",
+        status,
+        reason: typeof response.data?.reason === "string" ? response.data.reason : "declined",
+        peer: connection.name,
+        size: bytes.length,
+        sha256,
+      };
+    }
+
+    const acceptedId = typeof response.data?.offerId === "string" ? response.data.offerId : "";
+    const expiresAt = Date.now() + (options.expiresInSeconds ?? 600) * 1000;
+    this.files.addOutgoing({
+      offerId: acceptedId || offerId,
+      to: { nodeId: connection.nodeId, name: connection.name, host: connection.host, port: connection.port },
+      sourcePath: absolute,
+      displayName: sentName,
+      size: bytes.length,
+      sha256,
+      createdAt: Date.now(),
+      expiresAt,
+      served: false,
+    });
+
+    return {
+      offerId: acceptedId || offerId,
+      status,
+      reason: typeof response.data?.reason === "string" ? response.data.reason : "offered",
+      peer: connection.name,
+      size: bytes.length,
+      sha256,
+    };
+  }
+
+  /** Pull an offered file: the receiver fetches, verifies and stores it. */
+  async acceptFile(offerId: string): Promise<{
+    offer: IncomingOffer;
+    storedPath: string;
+    bytes: number;
+    sha256: string;
+  }> {
+    await this.ensureStarted();
+    const offer = this.files.incomingOffer(offerId);
+    if (!offer) throw new Error(`No offer with id "${offerId}".`);
+    if (offer.status === "accepted") throw new Error(`Offer ${offerId} was already collected.`);
+    if (offer.status !== "pending") throw new Error(`Offer ${offerId} is ${offer.status}.`);
+
+    const connection = this.connections.get(offer.from.nodeId);
+    if (!connection || !connection.outToken) {
+      throw new Error(`Not connected to ${offer.from.name}; the bytes come from there, so the link is needed.`);
+    }
+    if (!hasScope(connection.grantedToMe, "files:read")) {
+      throw new Error(
+        `${connection.name} did not grant this node the files:read scope, so the file cannot be collected.`,
+      );
+    }
+    if (offer.size > this.config.filesMaxBytes) {
+      throw new Error(`The offer is ${offer.size} bytes; this node accepts up to ${this.config.filesMaxBytes}.`);
+    }
+    if (this.files.overQuota(offer.from.nodeId, offer.size)) {
+      throw new Error(
+        `Accepting this would exceed the quota for ${offer.from.name}. Remove files with swarm_file action=delete first.`,
+      );
+    }
+    this.assertDiskSpace();
+
+    const target = this.files.targetPath(offer.from.nodeId, offerId);
+    const temp = this.files.tempPath(offer.from.nodeId, offerId);
+    fs.rmSync(temp, { force: true });
+
+    let result: { bytes: number; sha256: string };
+    try {
+      result = await downloadToFile(
+        `${baseUrl(connection.host, connection.port)}${API_PREFIX}/files/${offerId}`,
+        temp,
+        { token: connection.outToken, maxBytes: Math.min(this.config.filesMaxBytes, Math.max(offer.size, 1)) },
+      );
+    } catch (err) {
+      fs.rmSync(temp, { force: true });
+      throw err;
+    }
+
+    if (offer.sha256 && result.sha256 !== offer.sha256) {
+      fs.rmSync(temp, { force: true });
+      throw new Error(
+        `The file does not match what was offered (sha256 ${result.sha256.slice(0, 12)} instead of ${offer.sha256.slice(0, 12)}); it was deleted.`,
+      );
+    }
+
+    fs.renameSync(temp, target);
+    this.files.markAccepted(offerId, { storedPath: target, receivedBytes: result.bytes });
+    this.files.persist(this.fileIndexPath());
+    return { offer: offer, storedPath: target, bytes: result.bytes, sha256: result.sha256 };
+  }
+
+  declineFile(offerId: string): IncomingOffer {
+    const offer = this.files.decline(offerId);
+    if (!offer) throw new Error(`No offer with id "${offerId}".`);
+    return offer;
+  }
+
+  fileOffers(): IncomingOffer[] {
+    return this.files.pendingOffers();
+  }
+
+  receivedFiles() {
+    return this.files.receivedFiles();
+  }
+
+  /** Remove received files past their retention window; returns what went. */
+  sweepFiles(): Array<{ displayName: string; path: string }> {
+    const { removed } = this.files.sweep(this.config.filesRetentionDays);
+    if (removed.length > 0) this.files.persist(this.fileIndexPath());
+    return removed;
+  }
+
   // ------------------------------------------------------------------ talking
 
   async say(
@@ -1967,6 +2277,9 @@ export class SwarmNode {
       this.tokens.delete(connection.inToken);
       connection.inToken = undefined;
     }
+    // A reset means this node no longer trusts that peer's state: its offers
+    // and the files it already sent go with the token.
+    this.purgePeerFiles(connection.nodeId);
     return {
       nodeId: connection.nodeId,
       name: connection.name,

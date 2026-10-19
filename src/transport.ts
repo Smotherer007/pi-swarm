@@ -6,6 +6,8 @@
  * carrying the peer's own reason.
  */
 
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
 import * as http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as net from "node:net";
@@ -223,6 +225,114 @@ export async function requestJson<T = unknown>(
     if (!worthRetrying || isIpLiteral(hostname)) throw error;
     return requestOnce<T>(url, options, 4);
   }
+}
+
+
+export interface DownloadOptions {
+  token?: string | undefined;
+  /** Hard ceiling for the bytes that actually arrive. */
+  maxBytes: number;
+  timeoutMs?: number;
+}
+
+/**
+ * Fetch a URL straight into a file, counting the bytes that arrive.
+ *
+ * The size a peer announces is a claim, so the counter is the limit: an answer
+ * that exceeds it is aborted and the partial file deleted, which is also what
+ * happens when the hash does not match. Nothing is left half-written behind.
+ */
+export function downloadToFile(
+  url: string,
+  destPath: string,
+  options: DownloadOptions,
+): Promise<{ bytes: number; sha256: string }> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const headers: Record<string, string> = { accept: "application/octet-stream" };
+    if (options.token) headers.authorization = `Bearer ${options.token}`;
+
+    const cleanup = (err: Error) => {
+      try {
+        fs.rmSync(destPath, { force: true });
+      } catch {
+        /* the sweeper gets it later */
+      }
+      reject(err);
+    };
+
+    const req = http.request(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname.replace(/^\[|\]$/g, ""),
+        port: parsed.port,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "GET",
+        headers,
+        agent: false,
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        if (status !== 200) {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () => {
+            let reason = Buffer.concat(chunks).toString("utf-8");
+            try {
+              const parsedBody = JSON.parse(reason) as { error?: unknown };
+              if (typeof parsedBody.error === "string") reason = parsedBody.error;
+            } catch {
+              /* not JSON, keep the text */
+            }
+            cleanup(new TransportError(reason || `download failed with ${status}`, status));
+          });
+          return;
+        }
+
+        const hash = crypto.createHash("sha256");
+        const out = fs.createWriteStream(destPath, { mode: 0o640 });
+        let bytes = 0;
+        let failed = false;
+
+        const abort = (err: Error) => {
+          if (failed) return;
+          failed = true;
+          res.destroy();
+          out.destroy();
+          cleanup(err);
+        };
+
+        res.on("data", (chunk: Buffer) => {
+          if (failed) return;
+          bytes += chunk.length;
+          if (bytes > options.maxBytes) {
+            abort(new TransportError(`file exceeds ${options.maxBytes} bytes`, 413));
+            return;
+          }
+          hash.update(chunk);
+          if (!out.write(chunk)) res.pause();
+        });
+        out.on("drain", () => res.resume());
+        res.on("end", () => {
+          if (failed) return;
+          out.end(() => {
+            if (failed) return;
+            resolve({ bytes, sha256: hash.digest("hex") });
+          });
+        });
+        res.on("error", (err) => abort(err instanceof Error ? err : new Error(String(err))));
+        out.on("error", (err) => abort(err instanceof Error ? err : new Error(String(err))));
+      },
+    );
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      cleanup(new TransportError(`download timed out after ${timeoutMs} ms`));
+    });
+    req.on("error", (err) => cleanup(err instanceof Error ? err : new Error(String(err))));
+    req.end();
+  });
 }
 
 function requestOnce<T>(

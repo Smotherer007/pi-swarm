@@ -82,6 +82,11 @@ export function instanceDir(): string {
   return path.join(swarmDir(), "instances");
 }
 
+/** Where received files land, one directory per peer node id. */
+export function filesDir(): string {
+  return path.join(swarmDir(), "files");
+}
+
 export function sessionDir(sessionId: string): string {
   return path.join(sessionsDir(), sanitizeSegment(sessionId));
 }

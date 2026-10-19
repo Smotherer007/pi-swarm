@@ -80,6 +80,18 @@ export const SwarmSetupTool: ToolDefinition = {
           "Turn incoming peer messages into a session message (which can start a turn). Off by default, so peer text never spends tokens on its own.",
       }),
     ),
+    filesPolicy: Type.Optional(
+      Type.Union([Type.Literal("ask"), Type.Literal("auto"), Type.Literal("deny")], {
+        description:
+          "How an incoming file offer is decided: ask (default, it waits for you), auto (accept and collect at once), deny (refuse every offer).",
+      }),
+    ),
+    filesMaxBytes: Type.Optional(
+      Type.Number({ description: "Largest single file accepted or offered, in bytes. Default 25 MiB." }),
+    ),
+    filesRetentionDays: Type.Optional(
+      Type.Number({ description: "Days a received file is kept before the sweeper removes it. Default 7." }),
+    ),
     wakeOnRequest: Type.Optional(
       Type.Boolean({ description: "Wake the agent when a connect request arrives." }),
     ),
@@ -126,6 +138,9 @@ export const SwarmSetupTool: ToolDefinition = {
       "autoGrantKnowledgeWrite",
       "autoDeliverInbox",
       "wakeOnRequest",
+      "filesPolicy",
+      "filesMaxBytes",
+      "filesRetentionDays",
       "maxPeers",
       "maxMessagesPerMinute",
       "knowledgeRetentionDays",
@@ -164,7 +179,7 @@ export const SwarmSetupTool: ToolDefinition = {
       }`,
       `  peer messages start a turn: ${config.autoDeliverInbox ? "yes" : "no (inbox only)"}`,
       `  connect requests wake the agent: ${config.wakeOnRequest ? "yes" : "no"}`,
-      `  max peers: ${config.maxPeers}, messages per peer per minute: ${config.maxMessagesPerMinute}`,
+      `  files: policy ${config.filesPolicy}, max ${Math.round(config.filesMaxBytes / (1024 * 1024))} MiB, kept ${config.filesRetentionDays} days`,
       `  knowledge retention: ${config.knowledgeRetentionDays} days`,
     ];
     if (wasRunning) {

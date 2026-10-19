@@ -81,6 +81,7 @@ describe("extension wiring", () => {
         "swarm_broadcast",
         "swarm_connect",
         "swarm_discover",
+        "swarm_file",
         "swarm_inbox",
         "swarm_knowledge",
         "swarm_leave",

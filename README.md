@@ -219,6 +219,8 @@ Scopes, granted per link and per direction:
 | `chat` | send messages |
 | `knowledge:read` | pull entries from the other node's session board |
 | `knowledge:write` | push entries into it |
+| `files:write` | offer me a file (I decide whether to collect it) |
+| `files:read` | collect a file I offered |
 | `peers:share` | accept peer introductions (spreading the swarm across subnets) |
 | `session:invite` | reserved for joining a specific session |
 
@@ -266,6 +268,47 @@ granted nothing.
 
 Both directions are enforced: the granting side checks every request, and the
 calling side refuses to send what it was not granted instead of pretending.
+
+### Files
+
+One file at a time, in one direction, pulled by the receiver -- deliberately
+narrow, because "the swarm can read files" is a much larger promise than "an
+agent may hand another agent a file".
+
+```
+A: swarm_file action=offer peer="pi@workshop" path=./report.csv
+B: swarm_file action=offers      -> name, size, sha256, sender, expiry
+B: swarm_file action=accept offerId=f_...
+```
+
+The rules that shape it:
+
+- **The offered name is metadata, never a path.** On disk a file is named after
+  its transfer id inside a per-peer directory, so traversal, collisions,
+  reserved names and length limits cannot happen at all rather than being
+  checked one by one.
+- **The receiver pulls.** An offer carries name, size and sha256; the bytes are
+  fetched after the decision, which also means no half-written file can be
+  pushed onto anyone.
+- **The announced size is a claim.** A byte counter enforces `filesMaxBytes`
+  while the data arrives; a transfer that exceeds it is aborted and the partial
+  file deleted.
+- **The announced hash is a claim.** The receiver computes sha256 itself after
+  writing and deletes the file on a mismatch.
+- **An offer is single use and expires** after ten minutes, so no catalogue and
+  no browsing can grow out of it.
+- **No content enters the conversation.** A file lands on disk with its metadata;
+  reading it is a separate, deliberate step, and it is untrusted input. There is
+  no unpacking, no exec bit, no listing of anything but what was received.
+- **Quota and free space.** Per-peer quota (`4 × filesMaxBytes`) and a refusal
+  when free space drops below 200 MB, so a peer cannot quietly fill the disk.
+- `files:write` and `files:read` are never granted by default -- only an explicit
+  grant per peer counts, exactly like `knowledge:write`.
+- A ban, a forget or a token reset removes that peer's offers and the files it
+  sent.
+
+Received files are swept after `filesRetentionDays`, and the sweep reports what
+it removed instead of deleting in silence.
 
 ### Resetting a peer's token
 
@@ -368,6 +411,9 @@ directory.
 | `maxMessagesPerMinute` | `40` | Per link |
 | `beaconIntervalSeconds` | `10` | Beacon interval |
 | `knowledgeRetentionDays` | `7` | Session boards older than this are pruned (0 = keep) |
+| `filesPolicy` | `ask` | How an incoming file offer is decided: `ask`, `auto`, `deny` |
+| `filesMaxBytes` | `26214400` | Largest single file, enforced while the bytes arrive |
+| `filesRetentionDays` | `7` | Days a received file is kept before the sweeper removes it |
 
 ## Files
 

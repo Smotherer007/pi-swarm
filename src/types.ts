@@ -20,6 +20,15 @@ export const MAX_BODY_BYTES = 512 * 1024;
 export const MAX_TEXT_LENGTH = 20_000;
 export const MAX_KNOWLEDGE_TEXT = 4_000;
 export const MAX_KNOWLEDGE_ENTRIES_PER_PUSH = 100;
+
+/** A file transfer is capped on the wire, not by what the peer announces. */
+export const DEFAULT_MAX_FILE_BYTES = 25 * 1024 * 1024;
+/** Bytes an instance will accept from one peer in total before refusing more. */
+export const MAX_FILE_BYTES_PER_PEER = 4 * DEFAULT_MAX_FILE_BYTES;
+/** Below this much free space a transfer is refused instead of filling the disk. */
+export const MIN_FREE_DISK_BYTES = 200 * 1024 * 1024;
+/** An offer that is not collected within this window stops being collectable. */
+export const FILE_OFFER_TTL_MS = 10 * 60 * 1000;
 export const MAX_KEY_LENGTH = 64;
 export const MAX_PENDING_REQUESTS = 8;
 
@@ -37,6 +46,8 @@ export const ALL_SCOPES = [
   "chat",
   "knowledge:read",
   "knowledge:write",
+  "files:read",
+  "files:write",
   "peers:share",
   "session:invite",
 ] as const;
@@ -44,6 +55,9 @@ export const ALL_SCOPES = [
 export type Scope = (typeof ALL_SCOPES)[number];
 
 export type InboundPolicy = "ask" | "known-auto" | "open";
+
+/** How an incoming file offer is decided. */
+export type FilePolicy = "ask" | "auto" | "deny";
 
 export interface SwarmConfig {
   /** Display name other agents see. */
@@ -87,6 +101,12 @@ export interface SwarmConfig {
   beaconIntervalSeconds: number;
   /** Days a closed session's knowledge file is kept before pruning. */
   knowledgeRetentionDays: number;
+  /** How an incoming file offer is decided: ask (default), auto, or deny. */
+  filesPolicy: FilePolicy;
+  /** Largest single file, enforced while the bytes arrive. */
+  filesMaxBytes: number;
+  /** Days a received file is kept before the sweeper removes it. */
+  filesRetentionDays: number;
 }
 
 /** The public part of a peer: everything needed to reach it. */

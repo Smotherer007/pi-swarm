@@ -146,6 +146,20 @@ export class SwarmRuntime {
         );
         break;
       }
+      case "file-offer": {
+        const offer = event.offer;
+        this.post(
+          "swarm-file-offer",
+          [
+            `File offer from ${offer.from.name}: ${offer.displayName} (${offer.size} bytes, sha256 ${offer.sha256.slice(0, 12)}).`,
+            `Offer id ${offer.offerId}, expires in ${Math.round((offer.expiresAt - Date.now()) / 60000)} minutes.`,
+            "Accept with swarm_file action=accept, or decline it. Nothing has been downloaded yet.",
+          ].join("\n"),
+          config.filesPolicy === "ask",
+        );
+        this.notify(`File offer from ${offer.from.name}: ${offer.displayName}`, "info");
+        break;
+      }
       case "knowledge": {
         if (event.entries.length > 0) {
           const count = event.entries.length;

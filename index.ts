@@ -17,7 +17,8 @@
  *   swarm_say         send a message
  *   swarm_inbox       read what arrived
  *   swarm_knowledge   the shared session board
- *   swarm_peers       trust, auto-connect, ban
+ *   swarm_peers       trust, auto-connect, ban, reset a token
+ *   swarm_file        offer, accept, list and sweep transferred files
  *   swarm_leave       stop listening
  *
  * Nothing a peer sends is treated as an instruction. The node starts with the
@@ -38,6 +39,7 @@ import { SwarmSayTool } from "./src/tools/swarm-say.ts";
 import { SwarmInboxTool } from "./src/tools/swarm-inbox.ts";
 import { SwarmKnowledgeTool } from "./src/tools/swarm-knowledge.ts";
 import { SwarmPeersTool } from "./src/tools/swarm-peers.ts";
+import { SwarmFileTool } from "./src/tools/swarm-file.ts";
 import { SwarmLeaveTool } from "./src/tools/swarm-leave.ts";
 
 export default function (pi: ExtensionAPI) {
@@ -53,6 +55,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(SwarmInboxTool);
   pi.registerTool(SwarmKnowledgeTool);
   pi.registerTool(SwarmPeersTool);
+  pi.registerTool(SwarmFileTool);
   pi.registerTool(SwarmLeaveTool);
 
   // The runtime needs a context to show notifications and a status line.

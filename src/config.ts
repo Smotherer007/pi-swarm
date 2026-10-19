@@ -15,14 +15,16 @@
 
 import * as fs from "node:fs";
 
-import type { InboundPolicy, Scope, SwarmConfig } from "./types.ts";
+import type { FilePolicy, InboundPolicy, Scope, SwarmConfig } from "./types.ts";
 import { ALL_SCOPES, DEFAULT_PORT } from "./types.ts";
 import { configFilePath } from "./paths.ts";
 import { defaultName } from "./identity.ts";
 import { normalizeScopes } from "./permissions.ts";
 import { writePrivateJson } from "./fsutil.ts";
+import { DEFAULT_MAX_FILE_BYTES } from "./types.ts";
 
 const POLICIES: InboundPolicy[] = ["ask", "known-auto", "open"];
+const FILES_POLICIES: FilePolicy[] = ["ask", "auto", "deny"];
 
 let overrides: Partial<SwarmConfig> = {};
 let loaded = false;
@@ -46,6 +48,9 @@ export function defaults(): SwarmConfig {
     maxMessagesPerMinute: 40,
     beaconIntervalSeconds: 10,
     knowledgeRetentionDays: 7,
+    filesPolicy: "ask",
+    filesMaxBytes: DEFAULT_MAX_FILE_BYTES,
+    filesRetentionDays: 7,
   };
 }
 
@@ -169,6 +174,26 @@ export function updateConfig(
       throw new Error("beaconIntervalSeconds must be an integer between 2 and 120.");
     }
     next.beaconIntervalSeconds = value;
+  }
+  if (patch.filesPolicy !== undefined) {
+    if (!FILES_POLICIES.includes(patch.filesPolicy)) {
+      throw new Error(`filesPolicy must be one of: ${FILES_POLICIES.join(", ")}.`);
+    }
+    next.filesPolicy = patch.filesPolicy;
+  }
+  if (patch.filesMaxBytes !== undefined) {
+    const value = patch.filesMaxBytes;
+    if (!Number.isInteger(value) || value < 1024 || value > 512 * 1024 * 1024) {
+      throw new Error("filesMaxBytes must be an integer between 1024 and 536870912.");
+    }
+    next.filesMaxBytes = value;
+  }
+  if (patch.filesRetentionDays !== undefined) {
+    const value = patch.filesRetentionDays;
+    if (!Number.isInteger(value) || value < 1 || value > 365) {
+      throw new Error("filesRetentionDays must be an integer between 1 and 365.");
+    }
+    next.filesRetentionDays = value;
   }
   if (patch.knowledgeRetentionDays !== undefined) {
     const value = patch.knowledgeRetentionDays;

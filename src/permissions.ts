@@ -112,6 +112,12 @@ export function decideInbound(input: InboundDecisionInput): InboundDecision {
     Boolean(known?.trusted && known.scopes.includes("knowledge:write"));
   if (!writeKnowledge) ceiling.delete("knowledge:write");
 
+  // Files are never handed out or accepted by default: an explicit grant on the
+  // peer is the whole point, so the default ceiling does not apply to them.
+  for (const scope of ["files:read", "files:write"] as const) {
+    if (!known?.scopes.includes(scope)) ceiling.delete(scope);
+  }
+
   const grantable = wanted.filter((scope) => ceiling.has(scope));
 
   if (policy === "open") {

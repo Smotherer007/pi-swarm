@@ -150,6 +150,9 @@ export const SwarmPeersTool: ToolDefinition = {
         if (node.snapshot().connections.some((connection) => connection.nodeId === nodeId)) {
           await node.disconnect(nodeId, "banned on this node");
         }
+        // A ban is a statement about the peer, not only about its link: its
+        // open offers and the files it sent go too.
+        node.purgePeerFiles(nodeId);
         return {
           content: [
             {
@@ -170,6 +173,7 @@ export const SwarmPeersTool: ToolDefinition = {
       case "forget": {
         node.peers.forget(nodeId);
         await node.disconnect(nodeId, "forgotten");
+        node.purgePeerFiles(nodeId);
         return {
           content: [
             {
