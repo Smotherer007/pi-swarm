@@ -478,3 +478,106 @@ describe("an approval is the only decision a link needs", () => {
     await guest.stop();
   });
 });
+
+describe("a link that went stale", () => {
+  /** Host + guest, connected, sharing one peer book the restart can reuse. */
+  async function pair(name: string) {
+    const root = tempDir(`pi-swarm-${name}`);
+    dirs.push(root);
+    const identity = makeIdentity(name);
+    const peersPath = path.join(root, "peers.json");
+    const sessions = path.join(root, "sessions");
+    const hostConfig = makeConfig({ name: "host", inboundPolicy: "known-auto" });
+
+    const host = new SwarmNode({
+      config: hostConfig,
+      identity,
+      peersPath,
+      sessionsDir: sessions,
+      instanceDir: null,
+      discovery: false,
+    });
+    nodes.push(host);
+    const guest = makeNode("guest");
+
+    const h = await host.start();
+    await guest.start();
+    const connecting = guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    await waitFor(() => host.pendingRequests().length === 1);
+    host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
+    const attempt = await connecting;
+    assert.equal(attempt.status, "connected", attempt.reason);
+
+    /** Same identity, same port, same peer book: what a restart looks like. */
+    const restart = async () => {
+      await host.stop();
+      const next = new SwarmNode({
+        config: { ...hostConfig, port: h.port },
+        identity,
+        peersPath,
+        sessionsDir: sessions,
+        instanceDir: null,
+        discovery: false,
+      });
+      nodes.push(next);
+      await next.start();
+      return next;
+    };
+
+    return { host, guest, restart, port: h.port };
+  }
+
+  it("recovers on its own when the peer no longer knows the token", async () => {
+    const { host, guest, restart } = await pair("heal");
+
+    const before = await guest.say("vor dem Neustart");
+    assert.deepEqual(before.delivered, ["host"]);
+    assert.equal(host.drainInbox().length, 1);
+
+    // The restart invalidates every token the other side holds.
+    const restarted = await restart();
+
+    const after = await guest.say("nach dem Neustart");
+    assert.deepEqual(after.delivered, ["host"], "the message goes through after healing");
+    assert.deepEqual(after.failed, []);
+    const arrived = restarted.drainInbox();
+    assert.equal(arrived.length, 1);
+    assert.match(arrived[0].text, /nach dem Neustart/);
+
+    await guest.stop();
+    await restarted.stop();
+  });
+
+  it("does not claim to be connected to a peer that stopped answering", async () => {
+    const { host, guest, port } = await pair("deadlink");
+    await host.stop();
+
+    const attempt = await guest.connect(`127.0.0.1:${port}`, {
+      wait: true,
+      timeoutMs: 5_000,
+    });
+    assert.notEqual(attempt.status, "connected");
+    assert.notEqual(attempt.reason, "already connected");
+    await guest.stop();
+  });
+
+  it("drops a quiet link when the peer is gone", async () => {
+    const { host, guest } = await pair("reap");
+    const connection = guest.snapshot().connections[0];
+    assert.ok(connection);
+    // Pretend the link has been quiet for longer than the stale window.
+    connection.lastSeen = 0;
+
+    await host.stop();
+    const result = await guest.checkConnections();
+    assert.equal(result.checked, 1);
+    assert.equal(result.dropped.length, 1);
+    assert.equal(guest.snapshot().connections.length, 0);
+
+    await guest.stop();
+  });
+});

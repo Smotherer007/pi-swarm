@@ -223,6 +223,21 @@ connect to the agents I already know": when such a peer's beacon appears, this
 node connects with the scopes stored for it, and the peer approves through its
 own policy. A peer that was approved once carries the flag automatically.
 
+**"Automatically connected" means the node keeps looking.** A background keeper
+runs on a timer (twice the beacon interval, at least every 10 s) and dials every
+known peer marked `autoConnect` that is not connected yet:
+
+- nothing waits for it -- a tool call never blocks on a handshake, the agent
+  keeps working while the link is negotiated in the background
+- a peer that is offline is retried on every round, indefinitely; a peer whose
+  address on file went stale is probed first, so a machine that comes up later
+  is found without anyone asking again
+- one attempt per peer at a time: a second round skips a peer that is already
+  being negotiated
+- a link whose peer stopped answering is dropped instead of being reported as
+  connected, and a message to a link whose token the peer no longer knows
+  (it restarted) heals itself: drop, handshake again, deliver
+
 Both directions are enforced: the granting side checks every request, and the
 calling side refuses to send what it was not granted instead of pretending.
 

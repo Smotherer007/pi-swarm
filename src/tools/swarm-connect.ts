@@ -64,11 +64,27 @@ export const SwarmConnectTool: ToolDefinition = {
       timeoutMs,
     });
 
-    if (signal?.aborted) {
+    // An abort in the middle of the wait is not a failure of the link: the peer
+    // may already have approved, and a pending request stays in its queue. Say
+    // what actually happened instead of calling everything "aborted".
+    if (signal?.aborted && attempt.status !== "connected") {
+      const stillPending = attempt.status === "pending";
       return {
-        content: [{ type: "text" as const, text: "The connect request was aborted." }],
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              "Stopped waiting for the peer's decision.",
+              stillPending
+                ? `The request${attempt.requestId ? ` (${attempt.requestId})` : ""} stays queued there; swarm_connect again resumes it.`
+                : "The attempt did not end in a link.",
+              "",
+              formatAttempts([attempt]),
+            ].join("\n"),
+          },
+        ],
         details: { attempt },
-        isError: true,
+        isError: !stillPending && attempt.status === "denied",
       };
     }
 

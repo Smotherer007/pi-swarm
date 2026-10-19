@@ -108,6 +108,8 @@ export interface SwarmNodeOptions {
   onEvent?: (event: SwarmEvent) => void;
   /** Skip waiting for beacons in broadcast(); tests use this. */
   announceWaitMs?: number;
+  /** How often the background link keeper runs. Default: twice the beacon interval. */
+  maintainIntervalMs?: number;
 }
 
 export interface StartResult {
@@ -196,6 +198,10 @@ export class SwarmNode {
   private running = false;
   private rate = new Map<string, RateWindow>();
   private autoConnectTried = new Map<string, number>();
+  /** Peers a background attempt is currently negotiating with. */
+  private readonly autoConnecting = new Set<string>();
+  private maintainTimer: NodeJS.Timeout | null = null;
+  private readonly maintainIntervalMs: number;
   /** Highest knowledge timestamp already pulled from each peer. */
   private pullSince = new Map<string, number>();
   private seenInvitation = new Map<string, string>();
@@ -214,6 +220,8 @@ export class SwarmNode {
     this.multicastGroup = options.multicastGroup ?? "239.255.77.83";
     this.onEvent = options.onEvent;
     this.announceWaitMs = options.announceWaitMs ?? 2000;
+    this.maintainIntervalMs =
+      options.maintainIntervalMs ?? Math.max(10_000, this.config.beaconIntervalSeconds * 2_000);
 
     this.peers =
       options.peerStore ??
@@ -317,6 +325,8 @@ export class SwarmNode {
       });
     }
 
+    this.startMaintaining();
+
     return {
       port: handle.port,
       host: this.config.bindHost,
@@ -332,6 +342,10 @@ export class SwarmNode {
   }
 
   async stop(reason = "left the swarm"): Promise<void> {
+    if (this.maintainTimer) {
+      clearInterval(this.maintainTimer);
+      this.maintainTimer = null;
+    }
     const connections = [...this.connections.values()];
     await Promise.allSettled(
       connections
@@ -365,6 +379,77 @@ export class SwarmNode {
     this.seenInvitation.clear();
     this.autoConnectTried.clear();
     this.knowledge?.persist();
+  }
+
+  /**
+   * Keep looking for the links this node is supposed to have.
+   *
+   * Nothing here is awaited by a tool: the agent keeps working while a link is
+   * negotiated in the background. A peer that is offline is retried on every
+   * tick, indefinitely, so "connected" becomes true on its own once the other
+   * machine is back -- including a peer whose address on file is stale, which
+   * is why a quiet peer is probed before it is dialed.
+   */
+  private startMaintaining(): void {
+    if (this.maintainTimer) return;
+    this.maintainTimer = setInterval(() => {
+      void this.maintainLinks().catch(() => {
+        /* a failed round is retried on the next tick */
+      });
+    }, this.maintainIntervalMs);
+    this.maintainTimer.unref?.();
+  }
+
+  /** One round of the background link keeper. Public so a test can drive it. */
+  async maintainLinks(): Promise<{ attempted: string[]; dropped: string[] }> {
+    const attempted: string[] = [];
+    if (!this.running) return { attempted, dropped: [] };
+
+    const now = Date.now();
+    for (const known of this.peers.list()) {
+      if (known.banned || !known.autoConnect) continue;
+      if (this.connections.has(known.nodeId)) continue;
+      if (this.autoConnecting.has(known.nodeId)) continue;
+      if (now - (this.autoConnectTried.get(known.nodeId) ?? 0) < Math.min(this.maintainIntervalMs, 20_000)) {
+        continue;
+      }
+
+      this.autoConnectTried.set(known.nodeId, now);
+      this.autoConnecting.add(known.nodeId);
+      attempted.push(known.name);
+      void this.autoConnectTo(known).finally(() => this.autoConnecting.delete(known.nodeId));
+    }
+
+    const dropped = (await this.checkConnections().catch(() => ({ dropped: [] }))).dropped.map(
+      (entry) => entry.name,
+    );
+    return { attempted, dropped };
+  }
+
+  private async autoConnectTo(known: KnownPeer): Promise<void> {
+    try {
+      let target: PeerRef = {
+        nodeId: known.nodeId,
+        name: known.name,
+        host: known.host,
+        port: known.port,
+      };
+      if (Date.now() - (known.lastSeen ?? 0) > PEER_STALE_MS) {
+        // The stored address may be from before a restart; ask the peer where
+        // it listens now. A peer that does not answer is simply tried later.
+        const probed = await this.probe(target).catch(() => null);
+        if (!probed) return;
+        target = { nodeId: probed.nodeId, name: probed.name, host: probed.host, port: probed.port };
+      }
+      await this.connectPeer(target, {
+        scopes: known.scopes,
+        wait: true,
+        timeoutMs: 8000,
+        intent: "auto-connect",
+      });
+    } catch {
+      /* offline now, tried again on the next tick */
+    }
   }
 
   private accepting(): boolean {
@@ -439,19 +524,33 @@ export class SwarmNode {
       peer.accepting &&
       !this.connections.has(peer.nodeId)
     ) {
-      const last = this.autoConnectTried.get(peer.nodeId) ?? 0;
-      if (Date.now() - last > 60_000) {
-        this.autoConnectTried.set(peer.nodeId, Date.now());
-        void this.connectPeer(peer, {
-          scopes: known.scopes,
-          intent: "auto-connect",
-          wait: true,
-          timeoutMs: 8000,
-        }).catch(() => {
-          /* a failed auto-connect is retried on a later beacon */
-        });
-      }
+      this.scheduleAutoConnect(peer);
     }
+  }
+
+  /**
+   * Dial a peer that just announced itself. Fire and forget: a beacon must
+   * never slow the node down, and a failed attempt is simply retried later.
+   */
+  private scheduleAutoConnect(peer: DiscoveredPeer): void {
+    const known = this.peers.get(peer.nodeId);
+    if (!known || known.banned || !known.autoConnect) return;
+    if (this.connections.has(peer.nodeId) || this.autoConnecting.has(peer.nodeId)) return;
+    const now = Date.now();
+    if (now - (this.autoConnectTried.get(peer.nodeId) ?? 0) < 5_000) return;
+
+    this.autoConnectTried.set(peer.nodeId, now);
+    this.autoConnecting.add(peer.nodeId);
+    void this.connectPeer(peer, {
+      scopes: known.scopes,
+      intent: "auto-connect",
+      wait: true,
+      timeoutMs: 8000,
+    })
+      .catch(() => {
+        /* a failed auto-connect is retried on a later beacon or tick */
+      })
+      .finally(() => this.autoConnecting.delete(peer.nodeId));
   }
 
   private expireInvitation(): void {
@@ -732,13 +831,20 @@ export class SwarmNode {
   ): Promise<ConnectAttempt> {
     const existing = peer.nodeId ? this.connections.get(peer.nodeId) : undefined;
     if (existing && existing.outToken) {
-      return {
-        peer: { nodeId: existing.nodeId, name: existing.name, host: existing.host, port: existing.port },
-        status: "connected",
-        scopes: existing.grantedToMe,
-        sessionId: existing.sessionId,
-        reason: "already connected",
-      };
+      // A stored link can outlive the peer: it was restarted, moved, or shut
+      // down. Claiming "already connected" for a link that cannot send is worse
+      // than a fresh handshake, so the peer is asked whether it still answers.
+      if (await this.isReachable(existing)) {
+        existing.lastSeen = Date.now();
+        return {
+          peer: { nodeId: existing.nodeId, name: existing.name, host: existing.host, port: existing.port },
+          status: "connected",
+          scopes: existing.grantedToMe,
+          sessionId: existing.sessionId,
+          reason: "already connected",
+        };
+      }
+      this.dropConnection(existing.nodeId, "no answer from the peer");
     }
 
     // A retry must resume the request that is already queued on the peer, not
@@ -1598,19 +1704,10 @@ export class SwarmNode {
         });
         continue;
       }
-      try {
-        await requestJson(`${baseUrl(connection.host, connection.port)}${API_PREFIX}/message`, {
-          body: {
-            id: newId("m"),
-            text: clean,
-            kind,
-            sessionId: this.sessionId,
-          },
-          token: connection.outToken,
-          timeoutMs: 6000,
-        });
-        connection.lastSeen = Date.now();
-        delivered.push(connection.name);
+
+      const outcome = await this.deliver(connection, clean, kind);
+      if (outcome.ok) {
+        delivered.push(outcome.name);
         this.pushInbox({
           id: newId("m"),
           sessionId: this.sessionId ?? connection.sessionId,
@@ -1625,19 +1722,116 @@ export class SwarmNode {
           ts: Date.now(),
           incoming: false,
         });
-      } catch (err) {
-        const error = err as TransportError;
-        if (error.statusCode === 401) this.dropConnection(connection.nodeId, "token rejected");
-        failed.push({
-          nodeId: connection.nodeId,
-          name: connection.name,
-          error: error.message,
-        });
+      } else {
+        failed.push({ nodeId: connection.nodeId, name: connection.name, error: outcome.error });
       }
     }
 
     if (targets.length === 0) errors.push("no connections to send to");
     return { delivered, failed, errors };
+  }
+
+  /**
+   * Send one message, healing a link that has gone stale.
+   *
+   * A token outlives the peer that issued it. When the other pi restarts, the
+   * token is unknown there, and a link that still says "connected" cannot send
+   * any more. Rather than failing the message, the dead link is dropped and the
+   * handshake repeated once -- a peer that knows and trusts this node approves
+   * that on its own, so the message goes through without the user doing
+   * anything.
+   */
+  private async deliver(
+    connection: Connection,
+    text: string,
+    kind: MessageKind,
+  ): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+    try {
+      await this.postMessage(connection, text, kind);
+      connection.lastSeen = Date.now();
+      return { ok: true, name: connection.name };
+    } catch (err) {
+      const error = err as TransportError;
+      // 401: the peer does not know the token any more. No status: no answer.
+      const dead = error.statusCode === 401 || error.statusCode === undefined;
+      if (!dead) return { ok: false, error: error.message };
+
+      const why = error.statusCode === 401 ? "token rejected" : "no answer from the peer";
+      this.dropConnection(connection.nodeId, why);
+      const fresh = await this.reconnect(connection).catch(() => null);
+      if (!fresh) return { ok: false, error: `${error.message} (${why}; reconnecting failed)` };
+      try {
+        await this.postMessage(fresh, text, kind);
+        fresh.lastSeen = Date.now();
+        return { ok: true, name: fresh.name };
+      } catch (retryError) {
+        return { ok: false, error: `${(retryError as Error).message} (after reconnecting)` };
+      }
+    }
+  }
+
+  private async postMessage(connection: Connection, text: string, kind: MessageKind): Promise<void> {
+    await requestJson(`${baseUrl(connection.host, connection.port)}${API_PREFIX}/message`, {
+      body: { id: newId("m"), text, kind, sessionId: this.sessionId },
+      token: connection.outToken,
+      timeoutMs: 6000,
+    });
+  }
+
+  private async reconnect(connection: Connection): Promise<Connection | null> {
+    const peer: PeerRef = {
+      nodeId: connection.nodeId,
+      name: connection.name,
+      host: connection.host,
+      port: connection.port,
+    };
+    const attempt = await this.connectPeer(peer, {
+      wait: true,
+      timeoutMs: 12_000,
+      intent: "reconnect",
+    });
+    if (attempt.status !== "connected") return null;
+    return this.connections.get(connection.nodeId) ?? null;
+  }
+
+  /** Does the peer answer at all? Unauthenticated, so a rotated token is no death. */
+  private async isReachable(connection: Connection, timeoutMs = 2500): Promise<boolean> {
+    try {
+      await requestJson(`${baseUrl(connection.host, connection.port)}${API_PREFIX}/info`, { timeoutMs });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Drop links whose peer is gone.
+   *
+   * Without this a node keeps claiming a link to a machine that was shut down
+   * hours ago, and the first message to it fails. Only links that have been
+   * quiet for the stale window are checked, so healthy ones cost nothing.
+   */
+  async checkConnections(options: { timeoutMs?: number } = {}): Promise<{
+    checked: number;
+    dropped: Array<{ nodeId: string; name: string; reason: string }>;
+  }> {
+    const dropped: Array<{ nodeId: string; name: string; reason: string }> = [];
+    let checked = 0;
+    for (const connection of [...this.connections.values()]) {
+      if (Date.now() - connection.lastSeen < PEER_STALE_MS) continue;
+      checked += 1;
+      if (await this.isReachable(connection, options.timeoutMs)) {
+        connection.lastSeen = Date.now();
+        continue;
+      }
+      this.dropConnection(connection.nodeId, "no answer from the peer");
+      dropped.push({
+        nodeId: connection.nodeId,
+        name: connection.name,
+        reason: "no answer from the peer",
+      });
+    }
+    return { checked, dropped };
   }
 
   drainInbox(options: { limit?: number; clear?: boolean; since?: number } = {}): SwarmMessage[] {

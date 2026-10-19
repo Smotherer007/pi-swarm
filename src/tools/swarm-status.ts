@@ -2,6 +2,8 @@
  * swarm_status -- everything about this node in one look.
  *
  * Does not start the node: a status call must not open a port by surprise.
+ * It does ask whether a quiet link is still there, because a status that keeps
+ * listing a switched-off machine as connected is worse than no status.
  */
 
 import { Type } from "typebox";
@@ -19,10 +21,19 @@ export const SwarmStatusTool: ToolDefinition = {
 
   async execute() {
     const node = runtime().instance();
+    const dropped = node.isRunning ? (await node.checkConnections()).dropped : [];
     const snapshot = node.snapshot();
+    const lines = [formatStatus(snapshot)];
+    if (dropped.length > 0) {
+      lines.push(
+        "",
+        `Dropped ${dropped.length} link${dropped.length === 1 ? "" : "s"} that no longer answered:`,
+        ...dropped.map((entry) => `- ${entry.name}: ${entry.reason}`),
+      );
+    }
     return {
-      content: [{ type: "text" as const, text: formatStatus(snapshot) }],
-      details: snapshot,
+      content: [{ type: "text" as const, text: lines.join("\n") }],
+      details: { ...snapshot, dropped },
     };
   },
 };
