@@ -31,6 +31,7 @@ const ACTIONS = [
   "auto-connect",
   "manual-connect",
   "scopes",
+  "reset-peer-token",
   "note",
 ] as const;
 
@@ -43,7 +44,8 @@ export const SwarmPeersTool: ToolDefinition = {
     "Manage the peers this node knows: list them with trust, auto-connect, ban state and stored scopes; mark a peer trusted (may be auto-approved within its scopes); enable auto-connect for it (connect automatically when its beacon appears); ban it (never answer, drop existing link); unban, or forget it entirely. Changes persist across sessions.",
   parameters: Type.Object({
     action: Type.Union(ACTIONS.map((action) => Type.Literal(action)), {
-      description: "list (default), trust, untrust, ban, unban, forget, auto-connect, manual-connect, scopes, note.",
+      description:
+        "list (default), trust, untrust, ban, unban, forget, auto-connect, manual-connect, scopes, reset-peer-token, note.",
     }),
     peer: Type.Optional(Type.String({ description: "Peer name, node id, or host:port." })),
     scopes: Type.Optional(
@@ -207,6 +209,27 @@ export const SwarmPeersTool: ToolDefinition = {
             },
           ],
           details: { peer },
+        };
+      }
+      case "reset-peer-token": {
+        // The link stays; only the token this node issued is forgotten. That is
+        // the one state a peer cannot reach: it still believes it is connected,
+        // so the next call is refused and it has to re-handshake -- which is
+        // exactly the healing path, without dropping the connection first.
+        const revoked = node.revokePeerToken(nodeId);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: revoked.hadToken
+                ? [
+                    `Forgot the token issued to ${revoked.name}. The link is still there, so its next call is refused and it re-handshakes on its own.`,
+                    `What it may use here is unchanged: ${describeScopes(revoked.grantedToPeer)}.`,
+                  ].join("\n")
+                : `${revoked.name} holds no token from this node; nothing to reset.`,
+            },
+          ],
+          details: { revoked },
         };
       }
       case "note": {

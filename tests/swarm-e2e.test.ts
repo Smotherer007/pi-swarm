@@ -751,3 +751,56 @@ describe("a heal that grants less than before", () => {
     await host.stop();
   });
 });
+
+describe("resetting the token a peer holds", () => {
+  it("keeps the link and forces the peer through its heal path", async () => {
+    const root = tempDir("pi-swarm-revoke");
+    dirs.push(root);
+    const host = new SwarmNode({
+      config: makeConfig({ name: "revokehost", inboundPolicy: "known-auto" }),
+      identity: makeIdentity("revokehost"),
+      peersPath: path.join(root, "host-peers.json"),
+      sessionsDir: path.join(root, "host-sessions"),
+      instanceDir: null,
+      discovery: false,
+    });
+    nodes.push(host);
+    const guest = makeNode("revokeguest");
+    const events: string[] = [];
+    const h = await host.start();
+    await guest.start();
+
+    const connecting = guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    await waitFor(() => host.pendingRequests().length === 1);
+    host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
+    assert.equal((await connecting).status, "connected");
+
+    const before = host.snapshot().connections[0];
+    assert.ok(before.inToken, "the host issued a token");
+
+    const revoked = host.revokePeerToken("revokeguest");
+    assert.equal(revoked.hadToken, true);
+    assert.deepEqual(revoked.grantedToPeer, ["chat"], "the grant survives the reset");
+
+    // The link object is still there: this is not a disconnect.
+    const after = host.snapshot().connections[0];
+    assert.ok(after, "the link survived");
+    assert.equal(after.inToken, undefined, "but the token is gone");
+    assert.deepEqual(after.grantedToPeer, ["chat"]);
+
+    // The guest's next send is refused, and its heal delivers anyway.
+    const sent = await guest.say("nach dem Reset");
+    assert.deepEqual(sent.delivered, ["revokehost"]);
+    assert.deepEqual(sent.failed, []);
+    const healed = host.snapshot().connections[0];
+    assert.ok(healed.inToken, "a fresh token was issued by the re-handshake");
+
+    await guest.stop();
+    await host.stop();
+    assert.deepEqual(events, []);
+  });
+});

@@ -1927,6 +1927,43 @@ export class SwarmNode {
     this.tokens.set(connection.inToken, connection.nodeId);
   }
 
+  /**
+   * Forget the token this node issued to a peer, keeping the link.
+   *
+   * A peer whose token is gone while its own state still says "connected" is
+   * the one situation the heal path exists for, and it is otherwise impossible
+   * to produce without restarting a process: dropping the connection makes both
+   * sides re-handshake immediately, which skips the interesting step. The grant
+   * in the peer book stays, so the next handshake is approved without a human.
+   */
+  revokePeerToken(target: string): {
+    nodeId: string;
+    name: string;
+    hadToken: boolean;
+    grantedToPeer: Scope[];
+  } {
+    const peer = this.resolvePeer(target);
+    if (!peer) throw new Error(`No peer matches "${target}".`);
+    const connection = peer.nodeId ? this.connections.get(peer.nodeId) : undefined;
+    if (!connection) {
+      throw new Error(
+        `"${target}" is not connected, so this node holds no token for it. A token is only ever issued during a handshake.`,
+      );
+    }
+
+    const hadToken = Boolean(connection.inToken);
+    if (connection.inToken) {
+      this.tokens.delete(connection.inToken);
+      connection.inToken = undefined;
+    }
+    return {
+      nodeId: connection.nodeId,
+      name: connection.name,
+      hadToken,
+      grantedToPeer: [...connection.grantedToPeer],
+    };
+  }
+
   private async reconnect(connection: Connection): Promise<Connection | null> {
     const peer: PeerRef = {
       nodeId: connection.nodeId,

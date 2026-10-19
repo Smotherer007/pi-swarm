@@ -267,6 +267,15 @@ granted nothing.
 Both directions are enforced: the granting side checks every request, and the
 calling side refuses to send what it was not granted instead of pretending.
 
+### Resetting a peer's token
+
+`swarm_peers action=reset-peer-token peer=<name>` forgets the token this node
+issued to a peer and leaves the link itself alone. The peer still believes it is
+connected, so its next call is refused and it re-handshakes on its own -- the
+grant in the peer book is unchanged, so nobody has to approve anything. Useful
+when a token may have leaked, and the only way to exercise the heal path without
+restarting a process.
+
 ## Tools
 
 | Tool | Purpose |
