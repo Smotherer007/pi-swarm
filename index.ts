@@ -20,12 +20,13 @@
  *   swarm_peers       trust, auto-connect, ban
  *   swarm_leave       stop listening
  *
- * Nothing listens until a tool is used, and nothing a peer sends is treated as
- * an instruction.
+ * Nothing a peer sends is treated as an instruction. The node starts with the
+ * session, so an idle agent is discoverable without anyone calling a tool.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { getConfig } from "./src/config.ts";
 import { installRuntime, runtime } from "./src/runtime.ts";
 import { SwarmSetupTool } from "./src/tools/swarm-setup.ts";
 import { SwarmStatusTool } from "./src/tools/swarm-status.ts";
@@ -57,6 +58,15 @@ export default function (pi: ExtensionAPI) {
   // The runtime needs a context to show notifications and a status line.
   pi.on("session_start", (_event, ctx) => {
     runtime().attach(ctx);
+    // Autostart is what makes discovery work without a first tool call: two
+    // idle agents that both listen find each other on their own.
+    if (getConfig().autostart) {
+      void runtime()
+        .node(ctx)
+        .catch(() => {
+          /* a port that is taken must not break the session */
+        });
+    }
   });
 
   // Always close sockets, even when the session is replaced or reloaded.

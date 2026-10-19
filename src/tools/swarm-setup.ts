@@ -11,6 +11,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import { getConfig, updateConfig } from "../config.ts";
 import { loadIdentity } from "../identity.ts";
+import { instanceSlug } from "../paths.ts";
 import { describeScopes } from "../permissions.ts";
 import { shortId } from "../protocol.ts";
 import { runtime } from "../runtime.ts";
@@ -28,7 +29,7 @@ export const SwarmSetupTool: ToolDefinition = {
   name: "swarm_setup",
   label: "Swarm Setup",
   description:
-    "Configure this pi node's swarm identity and policy: display name, port, discovery, how incoming connect requests are decided (ask / known-auto / open), whether known peers connect automatically, the scopes offered by default, and whether shared session knowledge is allowed. Credentials do not exist; everything has a default. Changing a setting restarts the running node.",
+    "Configure this pi node's swarm identity and policy: display name, port, discovery, autostart, how incoming connect requests are decided (ask / known-auto / open), whether known peers connect automatically, the scopes offered by default, and whether shared session knowledge is allowed. Credentials do not exist; everything has a default. Changing a setting restarts the running node.",
   parameters: Type.Object({
     name: Type.Optional(Type.String({ description: "Display name other agents see, e.g. 'pi@laptop'." })),
     port: Type.Optional(
@@ -39,6 +40,12 @@ export const SwarmSetupTool: ToolDefinition = {
     ),
     discovery: Type.Optional(
       Type.Boolean({ description: "Announce on the multicast group and listen for beacons." }),
+    ),
+    autostart: Type.Optional(
+      Type.Boolean({
+        description:
+          "Start the node when a session starts instead of waiting for the first swarm tool. On by default: without it two idle agents never find each other.",
+      }),
     ),
     inboundPolicy: Type.Optional(
       Type.Union([Type.Literal("ask"), Type.Literal("known-auto"), Type.Literal("open")], {
@@ -110,6 +117,7 @@ export const SwarmSetupTool: ToolDefinition = {
       "port",
       "bindHost",
       "discovery",
+      "autostart",
       "inboundPolicy",
       "autoConnectKnown",
       "defaultScopes",
@@ -141,8 +149,10 @@ export const SwarmSetupTool: ToolDefinition = {
 
     const lines = [
       `Node "${config.name}" (${shortId(identity.nodeId)})`,
+      `  instance: ${instanceSlug() || "primary (PI_SWARM_INSTANCE unset)"}`,
       `  port: ${config.port === 0 ? "any free port" : config.port} on ${config.bindHost}`,
       `  discovery: ${config.discovery ? "on" : "off"}`,
+      `  starts with the session: ${config.autostart ? "yes" : "no (first swarm tool starts it)"}`,
       `  inbound policy: ${config.inboundPolicy as InboundPolicy}`,
       `  auto-connect known peers: ${config.autoConnectKnown ? "on" : "off"}`,
       `  seeds: ${(config.seeds ?? []).length > 0 ? config.seeds.join(", ") : "none (beacon only)"}`,
@@ -162,7 +172,9 @@ export const SwarmSetupTool: ToolDefinition = {
     }
     lines.push(
       "",
-      "Sensitive defaults: nothing is granted implicitly beyond the scopes above, unknown peers always wait for a decision, and peer text is never treated as instructions.",
+      "A second pi on this machine needs its own instance slot: start it with PI_SWARM_INSTANCE=<name>. It then has its own identity, peer book, config and port, and the two find each other like any other peers.",
+      "",
+      "Automatik: ein bekannter Peer wird bei jedem Beacon selbst verbunden, und eine einmal erteilte Freigabe gilt weiter. Ein fremder Peer braucht immer noch eine Entscheidung, und Peer-Text ist nie eine Anweisung.",
     );
 
     return {

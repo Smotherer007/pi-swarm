@@ -79,6 +79,7 @@ import type { HttpServerHandle } from "./transport.ts";
 import {
   identityFilePath,
   instanceDir,
+  instanceSlug,
   peersFilePath,
   sanitizeSegment,
   sessionsDir,
@@ -120,6 +121,8 @@ export interface StartResult {
 export interface SwarmSnapshot {
   nodeId: string;
   name: string;
+  /** The instance slot (PI_SWARM_INSTANCE), empty for the primary instance. */
+  instance: string;
   running: boolean;
   port: number | null;
   bindHost: string;
@@ -148,6 +151,21 @@ interface RateWindow {
 
 function isStale(peer: DiscoveredPeer): boolean {
   return Date.now() - peer.lastSeen > PEER_STALE_MS;
+}
+
+/**
+ * A stable second port for a named instance slot.
+ *
+ * Falling back to a random port works, but the address changes on every
+ * restart, which breaks seeds and stored peers. Deriving it from the slot name
+ * keeps `host:47824` true across restarts. Nothing is reserved: if the port is
+ * taken too, the caller falls back to a free one.
+ */
+function preferredPort(slug: string): number | null {
+  if (!slug) return null;
+  let hash = 0;
+  for (const char of slug) hash = (hash * 33 + char.charCodeAt(0)) % 100_000;
+  return DEFAULT_PORT + 1 + (hash % 63);
 }
 
 export class SwarmNode {
@@ -235,24 +253,33 @@ export class SwarmNode {
     }
 
     const warnings: string[] = [];
-    let handle: HttpServerHandle;
-    try {
-      handle = await startHttpServer({
-        port: this.config.port,
+    const listen = (port: number) =>
+      startHttpServer({
+        port,
         host: this.config.bindHost,
         handler: (req, res, body) => this.handleHttp(req, res, body),
       });
+
+    let handle: HttpServerHandle;
+    try {
+      handle = await listen(this.config.port);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EADDRINUSE" || this.config.port === 0) {
         throw err;
       }
-      handle = await startHttpServer({
-        port: 0,
-        host: this.config.bindHost,
-        handler: (req, res, body) => this.handleHttp(req, res, body),
-      });
+      // A second pi on this machine cannot have the same port. The usual case
+      // is an instance slot, and there the same port on every restart keeps
+      // host:port addresses (seeds, stored peers) valid.
+      const preferred = preferredPort(instanceSlug());
+      handle =
+        (preferred !== null
+          ? await listen(preferred).catch(() => null)
+          : null) ?? (await listen(0));
       warnings.push(
-        `Port ${this.config.port} is already in use; listening on ${handle.port} instead. Peers learn the real port from the beacon.`,
+        `Port ${this.config.port} is already in use; listening on ${handle.port} instead. Peers learn the real port from the beacon.` +
+          (preferred === null
+            ? " Start this pi with PI_SWARM_INSTANCE=<name> to give it its own identity and a stable port."
+            : ""),
       );
     }
 
@@ -263,14 +290,17 @@ export class SwarmNode {
     this.ensureSession();
     this.pruneOldSessions();
 
-    if (this.discoveryEnabled) {
+    // The local registry is not discovery in the multicast sense: it is how two
+    // pi instances on this machine see each other, and it works with the
+    // beacon switched off. Only a node with no registry directory stays silent.
+    if (this.discoveryEnabled || this.instanceDirPath !== null) {
       this.discovery = new Discovery({
         nodeId: this.identity.nodeId,
         name: this.config.name,
         port: handle.port,
         sessionId: this.sessionId,
         accepting: this.accepting(),
-        multicast: true,
+        multicast: this.discoveryEnabled,
         intervalSeconds: this.config.beaconIntervalSeconds,
         instanceDir: this.instanceDirPath,
         onPeer: (peer) => this.handleBeacon(peer),
@@ -1500,7 +1530,15 @@ export class SwarmNode {
     request.decidedAt = Date.now();
     request.sessionId = sessionId;
 
-    this.peers.touch(request.from, { scopes: granted });
+    this.peers.touch(request.from, {
+      scopes: granted,
+      // The approval is the decision this link needs. Recording it as trusted
+      // and auto-connect is what makes the pair of nodes reconnect on their
+      // own afterwards: this side dials out on the next beacon, and an inbound
+      // request from the same peer is approved without asking again.
+      // A banned peer stays banned -- an approval never undoes a ban.
+      ...(this.peers.get(request.from.nodeId)?.banned ? {} : { trusted: true, autoConnect: true }),
+    });
     return request;
   }
 
@@ -1732,6 +1770,7 @@ export class SwarmNode {
     return {
       nodeId: this.identity.nodeId,
       name: this.config.name,
+      instance: instanceSlug(),
       running: this.running,
       port: this.server?.port ?? null,
       bindHost: this.config.bindHost,

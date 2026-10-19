@@ -29,11 +29,12 @@ describe("config", () => {
     const config = getConfig();
     assert.equal(config.port, 47823);
     assert.equal(config.discovery, true);
+    assert.equal(config.autostart, true);
     assert.equal(config.inboundPolicy, "known-auto");
-    assert.equal(config.autoConnectKnown, false);
+    assert.equal(config.autoConnectKnown, true);
     assert.equal(config.autoGrantKnowledgeWrite, false);
-    assert.equal(config.autoDeliverInbox, false);
-    assert.equal(config.wakeOnRequest, false);
+    assert.equal(config.autoDeliverInbox, true);
+    assert.equal(config.wakeOnRequest, true);
     assert.deepEqual(config.defaultScopes, ["chat", "knowledge:read"]);
     assert.ok(config.name.length > 0);
   });

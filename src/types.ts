@@ -54,6 +54,11 @@ export interface SwarmConfig {
   bindHost: string;
   /** Announce and listen on the multicast group. */
   discovery: boolean;
+  /**
+   * Start the node when a session starts instead of waiting for the first
+   * swarm tool. Without this, two idle agents never find each other.
+   */
+  autostart: boolean;
   /** How incoming connect requests are decided. */
   inboundPolicy: InboundPolicy;
   /** Connect to known peers automatically when their beacon appears. */

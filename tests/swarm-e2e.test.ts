@@ -414,3 +414,67 @@ describe("knowledge sharing turned off", () => {
   });
 });
 
+describe("an approval is the only decision a link needs", () => {
+  it("remembers an approved peer as trusted and auto-connect, with the granted scopes", async () => {
+    const host = makeNode("firstApproval");
+    const guest = makeNode("approved");
+    const h = await host.start();
+    await guest.start();
+
+    assert.equal(host.peers.count(), 0, "nobody is known before the first contact");
+
+    const connecting = guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat", "knowledge:read"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    await waitFor(() => host.pendingRequests().length === 1);
+
+    // The requester is recorded when it asks, but without any policy: a
+    // request alone must never create an automatically reconnecting peer.
+    const before = host.peers.get("n_test_approved");
+    assert.equal(before?.trusted, false);
+    assert.equal(before?.autoConnect, false);
+
+    host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
+    assert.equal((await connecting).status, "connected");
+
+    const known = host.peers.get("n_test_approved");
+    assert.ok(known, "the approved peer is in the peer book");
+    assert.equal(known.trusted, true, "a second inbound request needs no decision");
+    assert.equal(known.autoConnect, true, "the next beacon reconnects on its own");
+    assert.deepEqual(known.scopes, ["chat"], "only what was granted is remembered");
+
+    await host.stop();
+    await guest.stop();
+  });
+
+  it("never un-bans a peer that is approved anyway", async () => {
+    const host = makeNode("bannedHost");
+    const guest = makeNode("bannedGuest");
+    const h = await host.start();
+    await guest.start();
+
+    // Make the peer known and banned before it asks.
+    host.peers.touch(
+      { nodeId: "n_test_bannedGuest", name: "bannedGuest", host: "127.0.0.1", port: 1 },
+      { banned: true },
+    );
+
+    const connecting = guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat"],
+      wait: true,
+      timeoutMs: 5_000,
+    });
+    const attempt = await connecting;
+    assert.notEqual(attempt.status, "connected", "a banned peer is refused at the door");
+    assert.equal(host.pendingRequests().length, 0, "and never reaches the consent queue");
+
+    const known = host.peers.get("n_test_bannedGuest");
+    assert.equal(known?.banned, true);
+    assert.equal(known?.trusted, false);
+
+    await host.stop();
+    await guest.stop();
+  });
+});

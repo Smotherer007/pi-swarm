@@ -1,10 +1,16 @@
 /**
  * Configuration: defaults plus whatever the user saved.
  *
- * The defaults are deliberately conservative. Nothing listens on the network
- * until a swarm tool is used, unknown peers always need a decision, knowledge
- * writing is not granted automatically, and peer content never enters the
- * model context on its own.
+ * The defaults describe the steady state of a working pair of agents: the
+ * node listens from session start, known peers are reconnected on their next
+ * beacon, and what a peer says arrives in the conversation. The one decision
+ * that is never automated is the first contact with a stranger: an unknown
+ * peer has to be approved once, and only then does the automatic behaviour
+ * apply to it.
+ *
+ * What stays conservative: nothing is granted implicitly beyond the default
+ * scopes, a stranger never gets in without an approval, knowledge writing
+ * still needs a grant, and peer text is never treated as an instruction.
  */
 
 import * as fs from "node:fs";
@@ -27,15 +33,16 @@ export function defaults(): SwarmConfig {
     port: 47823,
     bindHost: "0.0.0.0",
     discovery: true,
+    autostart: true,
     inboundPolicy: "known-auto",
-    autoConnectKnown: false,
+    autoConnectKnown: true,
     defaultScopes: ["chat", "knowledge:read"],
     seeds: [],
     maxPeers: 8,
     shareKnowledge: true,
     autoGrantKnowledgeWrite: false,
-    autoDeliverInbox: false,
-    wakeOnRequest: false,
+    autoDeliverInbox: true,
+    wakeOnRequest: true,
     maxMessagesPerMinute: 40,
     beaconIntervalSeconds: 10,
     knowledgeRetentionDays: 7,
@@ -109,6 +116,7 @@ export function updateConfig(
     next.bindHost = bindHost;
   }
   if (patch.discovery !== undefined) next.discovery = Boolean(patch.discovery);
+  if (patch.autostart !== undefined) next.autostart = Boolean(patch.autostart);
   if (patch.inboundPolicy !== undefined) {
     if (!POLICIES.includes(patch.inboundPolicy)) {
       throw new Error(`inboundPolicy must be one of: ${POLICIES.join(", ")}.`);

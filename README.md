@@ -32,7 +32,21 @@ pi --extension ~/Documents/Workspaces/pi-swarm
 
 ## Quick start
 
-Both machines need the extension. Nothing listens until you use a swarm tool.
+Both machines need the extension. A peer has to be approved once; after that
+the two nodes find and reconnect to each other on their own.
+
+```
+# first contact, either direction -- approve once on the side that is asked
+A: swarm_discover                      -> sees the peers on this network
+A: swarm_connect peer="pi@workshop"
+B: swarm_requests action=approve       -> done, for good
+
+# from here on, with no further input on any side:
+#   both nodes start with their session   (autostart)
+#   each reconnects to the other on its next beacon   (autoConnectKnown)
+#   a second request from that peer needs no decision   (known-auto)
+#   messages and connect requests land in the history and get a turn
+```
 
 Two directions, depending on who should ask whom:
 
@@ -156,11 +170,21 @@ Worth knowing:
 5. **Use it.** Every later call carries the token, and the scope is checked
    again on every single request.
 
-An agent only acts when its pi is working on something. The receiver sees a
-notification (and the request in its queue), but its agent will not decide on
-its own unless `swarm_setup wakeOnRequest=true` lets the request start a turn.
-For an unattended swarm, enable it on the node that should react by itself; it
-is off by default so a stranger cannot spend the user's tokens.
+An agent only acts when its pi is working on something. A connect request now
+arrives in the conversation and starts a turn (`wakeOnRequest=true`, the
+default), so the agent asks the user -- the same way it would pass on a chat
+request. Set `wakeOnRequest=false` on a node that must never be woken by a
+stranger.
+
+**The first approval is the only one.** Approving a request stores the peer as
+`trusted` + `autoConnect` with exactly the granted scopes, so from then on:
+
+- a new request from the same peer is approved by `known-auto` without asking
+- this node dials the peer again on its next beacon (`autoConnectKnown`)
+- a ban is never lifted by an approval
+
+What stays manual: a stranger is always a decision, and `knowledge:write` still
+needs an explicit grant.
 
 A link is directional. If A connected to B, A may use the scopes B granted; B
 may not call A. B connects back (or is auto-connected) when it needs the other
@@ -194,10 +218,10 @@ Automatic approval is deliberately narrow:
 - `shareKnowledge false` strips every `knowledge:*` scope, even a manual grant
 - a ban beats everything, and drops an existing link
 
-Auto-connect (`autoConnectKnown` + `swarm_peers auto-connect <peer>`) is the
-setting for "just connect to the agents I already know": when such a peer's
-beacon appears, this node connects with the scopes stored for it, and the peer
-approves through its own policy.
+Auto-connect (`autoConnectKnown`, on by default) is the setting for "just
+connect to the agents I already know": when such a peer's beacon appears, this
+node connects with the scopes stored for it, and the peer approves through its
+own policy. A peer that was approved once carries the flag automatically.
 
 Both directions are enforced: the granting side checks every request, and the
 calling side refuses to send what it was not granted instead of pretending.
@@ -206,7 +230,7 @@ calling side refuses to send what it was not granted instead of pretending.
 
 | Tool | Purpose |
 |---|---|
-| `swarm_setup` | name, port, discovery, policy, auto-connect, default scopes, limits |
+| `swarm_setup` | name, port, discovery, autostart, policy, auto-connect, default scopes, limits |
 | `swarm_status` | identity, session, links with both scope directions, pending requests, visible peers |
 | `swarm_discover` | announce, wait for beacons, probe known peers by address; shows invitations |
 | `swarm_connect` | request a link to one peer (name, node id, `host:port`) |
@@ -224,9 +248,11 @@ Commands: `/swarm`, `/swarm-broadcast`, `/swarm-leave`.
 
 Peer text is third-party content and is treated that way:
 
-- **Nothing arrives on its own.** Messages land in an inbox that the agent
-  pulls; peer content never starts a turn unless `autoDeliverInbox` (or
-  `wakeOnRequest` for connect requests) is enabled on purpose.
+- **Nothing arrives on its own ... except what you allowed.** Messages land in
+  the conversation history and start a turn when `autoDeliverInbox` is on (the
+  default); connection and disconnection are history only, never a turn.
+  `swarm_setup autoDeliverInbox=false wakeOnRequest=false` returns the node to
+  inbox-only behaviour, where nothing a peer sends can spend tokens.
 - **Labelled.** Every inbox and knowledge block that contains peer text is
   marked with the author, and the tool descriptions and the inbox formatter say
   explicitly that it is not an instruction from the user.
@@ -279,15 +305,16 @@ directory.
 | `port` | `47823` | TCP port (0 = free port; falls back automatically if taken) |
 | `bindHost` | `0.0.0.0` | Interface to bind (dual-stack; use `::` for IPv6-only, or a specific address to keep the swarm inside a VPN) |
 | `discovery` | `true` | Multicast beacon + listeners |
+| `autostart` | `true` | Start the node with the session, so discovery works without a tool call |
 | `inboundPolicy` | `known-auto` | How incoming requests are decided |
-| `autoConnectKnown` | `false` | Connect to known peers when their beacon appears |
+| `autoConnectKnown` | `true` | Connect to known peers when their beacon appears |
 | `defaultScopes` | `chat, knowledge:read` | Offered by default, and the auto-grant ceiling |
 | `seeds` | `[]` | Addresses probed directly, for peers a beacon cannot reach (other subnet, VPN, container) |
 | `maxPeers` | `8` | Refuse more connections |
 | `shareKnowledge` | `true` | Allow the session board |
 | `autoGrantKnowledgeWrite` | `false` | Grant write without a decision |
-| `autoDeliverInbox` | `false` | Peer messages may start a turn |
-| `wakeOnRequest` | `false` | Connect requests may start a turn |
+| `autoDeliverInbox` | `true` | Peer messages reach the conversation and start a turn |
+| `wakeOnRequest` | `true` | Connect requests reach the conversation and start a turn |
 | `maxMessagesPerMinute` | `40` | Per link |
 | `beaconIntervalSeconds` | `10` | Beacon interval |
 | `knowledgeRetentionDays` | `7` | Session boards older than this are pruned (0 = keep) |

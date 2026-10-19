@@ -10,7 +10,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 
-import { identityFilePath } from "./paths.ts";
+import { identityFilePath, instanceSlug } from "./paths.ts";
 import { writePrivateJson } from "./fsutil.ts";
 
 export interface Identity {
@@ -64,10 +64,14 @@ export function loadIdentity(filePath: string = identityFilePath()): Identity {
   return identity;
 }
 
-/** Default display name: pi@<hostname>. */
-export function defaultName(): string {
+/**
+ * Default display name: pi@<hostname>, plus the instance slot when there is
+ * one, so two agents on the same machine are distinguishable by name too.
+ */
+export function defaultName(instance: string = instanceSlug()): string {
   const host = os.hostname().replace(/\.local$/i, "").trim();
-  return host ? `pi@${host}` : "pi";
+  const base = host ? `pi@${host}` : "pi";
+  return instance ? `${base}/${instance}` : base;
 }
 
 /** Short label for transcripts and status lines. */

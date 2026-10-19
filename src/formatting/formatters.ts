@@ -45,8 +45,14 @@ export function formatStatus(snapshot: SwarmSnapshot): string {
       }`,
     );
   } else {
-    lines.push("  not running (the next swarm tool starts it)");
+    lines.push("  not running (starts with the session; the next swarm tool starts it now)");
   }
+
+  lines.push(
+    `  instance: ${snapshot.instance || "primary"}${
+      snapshot.instance ? "" : " (start another pi on this machine with PI_SWARM_INSTANCE=<name>)"
+    }`,
+  );
 
   lines.push(`  session: ${snapshot.sessionId ?? "none yet"}`);
   if (snapshot.invitation) {

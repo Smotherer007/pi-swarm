@@ -40,6 +40,7 @@ const request: IncomingRequest = {
 const snapshot: SwarmSnapshot = {
   nodeId: "n_self0123456789",
   name: "pi@lab",
+  instance: "",
   running: false,
   port: null,
   bindHost: "0.0.0.0",
@@ -65,6 +66,13 @@ describe("formatStatus", () => {
     assert.match(text, /not running/);
     assert.match(text, /next swarm tool starts it/);
     assert.match(text, /policy: known-auto/);
+    assert.match(text, /instance: primary/);
+  });
+
+  it("names the instance slot when there is one", () => {
+    const text = formatStatus({ ...snapshot, instance: "worker" });
+    assert.match(text, /instance: worker/);
+    assert.doesNotMatch(text, /PI_SWARM_INSTANCE/);
   });
 
   it("lists connections with both scope directions", () => {
