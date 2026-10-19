@@ -20,6 +20,7 @@
  */
 
 import * as path from "node:path";
+import * as fs from "node:fs";
 
 import type {
   ConnectAttempt,
@@ -58,6 +59,7 @@ import {
   normalizeScopes,
 } from "./permissions.ts";
 import { KnowledgeBase, pruneSessions } from "./knowledge.ts";
+import { writePrivateJson } from "./fsutil.ts";
 import {
   ProtocolError,
   parseApproval,
@@ -408,7 +410,11 @@ export class SwarmNode {
     const now = Date.now();
     for (const known of this.peers.list()) {
       if (known.banned || !known.autoConnect) continue;
-      if (this.connections.has(known.nodeId)) continue;
+      // A connection without an outbound token is half a link: this node may
+      // receive but cannot send, and nothing else ever asks for the missing
+      // half -- the peer has no reason to dial again. Completing it is part of
+      // being connected, so it is treated like no connection at all.
+      if (this.connections.get(known.nodeId)?.outToken) continue;
       if (this.autoConnecting.has(known.nodeId)) continue;
       if (now - (this.autoConnectTried.get(known.nodeId) ?? 0) < Math.min(this.maintainIntervalMs, 20_000)) {
         continue;
@@ -461,11 +467,44 @@ export class SwarmNode {
       if (!this.knowledge) this.openKnowledge(this.sessionId);
       return this.sessionId;
     }
-    const sessionId = newId("s");
+    // Resume the session this instance had before the restart. The shared board
+    // belongs to the session, so a new id on every start would throw the
+    // knowledge away -- while the retention setting promises to keep it.
+    const sessionId = this.rememberedSession() ?? newId("s");
     this.sessionId = sessionId;
     this.openKnowledge(sessionId);
+    this.rememberSession(sessionId);
     this.discovery?.setState({ sessionId, accepting: this.accepting() });
     return sessionId;
+  }
+
+  /** Where this instance notes the session it is on, so a restart can resume it. */
+  private sessionPointerPath(): string {
+    const slug = instanceSlug();
+    return path.join(this.sessionsDirPath, slug ? `current-${slug}.json` : "current.json");
+  }
+
+  private rememberedSession(): string | null {
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.sessionPointerPath(), "utf-8")) as {
+        sessionId?: unknown;
+      };
+      const sessionId = typeof raw.sessionId === "string" ? raw.sessionId : "";
+      if (!sessionId) return null;
+      // A pruned session cannot be resumed; its directory is the evidence.
+      const dir = path.join(this.sessionsDirPath, sanitizeSegment(sessionId));
+      return fs.existsSync(dir) ? sessionId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private rememberSession(sessionId: string): void {
+    try {
+      writePrivateJson(this.sessionPointerPath(), { sessionId, updatedAt: Date.now() });
+    } catch {
+      /* an unwritable home only costs the resumption */
+    }
   }
 
   /** Move to another session, keeping the knowledge this node already has. */
@@ -477,6 +516,7 @@ export class SwarmNode {
     const previous = this.knowledge;
     this.sessionId = sessionId;
     this.openKnowledge(sessionId);
+    this.rememberSession(sessionId);
     if (previous && this.knowledge && previous.size > 0) {
       this.knowledge.merge(previous.all());
     }
@@ -535,7 +575,10 @@ export class SwarmNode {
   private scheduleAutoConnect(peer: DiscoveredPeer): void {
     const known = this.peers.get(peer.nodeId);
     if (!known || known.banned || !known.autoConnect) return;
-    if (this.connections.has(peer.nodeId) || this.autoConnecting.has(peer.nodeId)) return;
+    // Only a link with both halves counts; one with nothing outbound can send
+    // nothing and still needs its handshake.
+    if (this.connections.get(peer.nodeId)?.outToken) return;
+    if (this.autoConnecting.has(peer.nodeId)) return;
     const now = Date.now();
     if (now - (this.autoConnectTried.get(peer.nodeId) ?? 0) < 5_000) return;
 

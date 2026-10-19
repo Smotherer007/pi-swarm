@@ -124,3 +124,42 @@ describe("the background link keeper", () => {
     assert.ok(elapsed < 2000, `a round blocked for ${elapsed} ms instead of returning`);
   });
 });
+
+describe("a link that only came in", () => {
+  it("is completed by the keeper instead of staying one-way", async () => {
+    const host = build({ name: "half-host" });
+    const guest = build({ name: "half-guest" });
+    const startedHost = await host.start();
+    await guest.start();
+
+    // The guest dials; the host only approves, so it holds an inbound token and
+    // no outbound one. Nothing else would ever ask for that missing half.
+    const connecting = guest.connect(`127.0.0.1:${startedHost.port}`, {
+      scopes: ["chat"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    await waitFor(() => host.pendingRequests().length === 1);
+    host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
+    assert.equal((await connecting).status, "connected");
+
+    const half = host.snapshot().connections[0];
+    assert.ok(half.inToken, "the host can receive");
+    assert.equal(half.outToken, undefined, "but cannot send yet");
+
+    // Make each side known to the other, as an approval would.
+    host.peers.touch(
+      { nodeId: "n_test_half-guest", name: "half-guest", host: "127.0.0.1", port: guest.port ?? 1 },
+      { trusted: true, autoConnect: true, scopes: ["chat"] },
+    );
+    guest.peers.touch(
+      { nodeId: "n_test_half-host", name: "half-host", host: "127.0.0.1", port: startedHost.port },
+      { trusted: true, scopes: ["chat"] },
+    );
+
+    await waitFor(() => Boolean(host.snapshot().connections[0]?.outToken), 15_000, 100);
+    const whole = host.snapshot().connections[0];
+    assert.ok(whole.outToken, "the keeper completed the link");
+    assert.deepEqual(whole.grantedToMe, ["chat"], "with what the guest granted");
+  });
+});
