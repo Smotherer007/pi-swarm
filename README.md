@@ -190,6 +190,26 @@ A link is directional. If A connected to B, A may use the scopes B granted; B
 may not call A. B connects back (or is auto-connected) when it needs the other
 direction. `swarm_say` says so instead of silently dropping the message.
 
+### One identity, one process
+
+Two nodes under one identity are worse than useless: peers identify a link by
+nodeId, so they see one peer whose port and token map change every few seconds.
+Every heal then alternates between a process that knows their token and one that
+does not -- which looks exactly like a healing bug and cannot be told apart from
+the outside.
+
+So a second node under an identity that another pi on this machine is already
+running does not start at all. It says so, with the pid and the way out:
+
+```
+Swarm did not start: Another pi on this machine already runs this swarm
+identity (pid 4242, node n_ab12...). A second node needs its own slot:
+start it with PI_SWARM_INSTANCE=<name>.
+```
+
+Give the second process a slot and both run side by side with their own
+identity, peer book, config and a stable port of their own.
+
 ## Permissions
 
 Scopes, granted per link and per direction:

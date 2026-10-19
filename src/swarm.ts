@@ -69,7 +69,7 @@ import {
   parseMessage,
   sanitizeText,
 } from "./protocol.ts";
-import { Discovery } from "./discovery.ts";
+import { Discovery, pidAlive } from "./discovery.ts";
 import {
   baseUrl,
   requestJson,
@@ -156,6 +156,9 @@ interface RateWindow {
 function isStale(peer: DiscoveredPeer): boolean {
   return Date.now() - peer.lastSeen > PEER_STALE_MS;
 }
+
+/** Identities this process is running, so a second node here is refused too. */
+const runningIdentities = new Set<string>();
 
 /**
  * A stable second port for a named instance slot.
@@ -262,6 +265,8 @@ export class SwarmNode {
       };
     }
 
+    this.assertUniqueIdentity();
+
     const warnings: string[] = [];
     const listen = (port: number) =>
       startHttpServer({
@@ -295,6 +300,7 @@ export class SwarmNode {
 
     this.server = handle;
     this.running = true;
+    runningIdentities.add(this.identity.nodeId);
     this.startedAt = Date.now();
 
     this.ensureSession();
@@ -375,12 +381,63 @@ export class SwarmNode {
     this.rate.clear();
     this.inbox = [];
     this.running = false;
+    runningIdentities.delete(this.identity.nodeId);
     this.startedAt = null;
     this.invitation = null;
     this.invitationUntil = 0;
     this.seenInvitation.clear();
     this.autoConnectTried.clear();
     this.knowledge?.persist();
+  }
+
+  /** One slot per identity, across every process on this machine. */
+  private instanceRecordPath(): string | null {
+    if (!this.instanceDirPath) return null;
+    const name = `${this.identity.nodeId.replace(/[^a-zA-Z0-9._-]/g, "_")}.json`;
+    return path.join(this.instanceDirPath, name);
+  }
+
+  /**
+   * Refuse to run two nodes under one identity.
+   *
+   * A duplicate identity is not a cosmetic problem. Peers identify a link by
+   * nodeId, so two processes under one id look to them like one peer whose port
+   * and token map change every few seconds: their heals alternate between a
+   * process that knows their token and one that does not, which is exactly the
+   * shape of a healing bug. Since nobody can tell those apart from the outside,
+   * the second node does not start at all and says why.
+   */
+  private assertUniqueIdentity(): void {
+    const nodeId = this.identity.nodeId;
+    if (runningIdentities.has(nodeId)) {
+      throw new Error(
+        `This process already runs a swarm node as ${nodeId}. A second node needs its own identity: ` +
+          "start it with PI_SWARM_INSTANCE=<name>. Two nodes under one identity are indistinguishable " +
+          "from one peer with a changing port, which breaks the link for everyone else.",
+      );
+    }
+
+    const filePath = this.instanceRecordPath();
+    if (!filePath) return;
+
+    let otherPid = 0;
+    try {
+      if (!fs.existsSync(filePath)) return;
+      const record = JSON.parse(fs.readFileSync(filePath, "utf-8")) as { pid?: unknown };
+      otherPid = Number(record.pid);
+    } catch {
+      // An unreadable registry file is not a reason to refuse to start.
+      return;
+    }
+    if (!Number.isInteger(otherPid) || otherPid <= 0 || otherPid === process.pid) return;
+    if (!pidAlive(otherPid)) return;
+
+    throw new Error(
+      `Another pi on this machine already runs this swarm identity (pid ${otherPid}, node ${nodeId}). ` +
+        "A second node needs its own slot: start it with PI_SWARM_INSTANCE=<name>. " +
+        "Two processes under one identity are indistinguishable from one peer with a changing port, " +
+        "which breaks the link for everyone else.",
+    );
   }
 
   /**

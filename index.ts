@@ -63,8 +63,10 @@ export default function (pi: ExtensionAPI) {
     if (getConfig().autostart) {
       void runtime()
         .node(ctx)
-        .catch(() => {
-          /* a port that is taken must not break the session */
+        .catch((error: unknown) => {
+          // A refused start (a duplicate identity, a port that cannot be bound)
+          // must not be silent: the swarm would simply look dead.
+          runtime().reportStartFailure(error);
         });
     }
   });

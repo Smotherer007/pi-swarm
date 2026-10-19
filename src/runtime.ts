@@ -78,6 +78,13 @@ export class SwarmRuntime {
     this.updateStatus();
   }
 
+  /** Something went wrong before the node could listen; say it where it is seen. */
+  reportStartFailure(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.notify(`Swarm did not start: ${message}`, "error");
+    this.post("swarm-start-failed", `Swarm did not start: ${message}`, false);
+  }
+
   private handleEvent(event: SwarmEvent): void {
     const config = this.nodeInstance?.config ?? getConfig();
 

@@ -143,3 +143,104 @@ describe("two instances on one machine", () => {
     assert.equal(a.snapshot().connections.length, 1);
   });
 });
+
+describe("one identity, one process", () => {
+  it("refuses to start a second node under the same identity", async () => {
+    const registry = instanceDir();
+    const identity = loadIdentity();
+
+    const first = new SwarmNode({
+      config: makeConfig({ name: "first" }),
+      identity,
+      peersPath: path.join(registry, "..", "peers-first.json"),
+      sessionsDir: path.join(registry, "..", "sessions-first"),
+      instanceDir: registry,
+      discovery: false,
+    });
+    nodes.push(first);
+    await first.start();
+
+    // Same identity, same registry: the second node must not open at all.
+    const second = new SwarmNode({
+      config: makeConfig({ name: "second" }),
+      identity,
+      peersPath: path.join(registry, "..", "peers-second.json"),
+      sessionsDir: path.join(registry, "..", "sessions-second"),
+      instanceDir: registry,
+      discovery: false,
+    });
+    nodes.push(second);
+
+    await assert.rejects(
+      () => second.start(),
+      (error: Error) => /identity/.test(error.message) && /PI_SWARM_INSTANCE/.test(error.message),
+    );
+    await first.stop();
+  });
+
+  it("lets a node with its own slot start next to it", async () => {
+    const registry = instanceDir();
+    const primary = loadIdentity();
+    process.env.PI_SWARM_INSTANCE = "worker";
+    const worker = loadIdentity();
+    assert.notEqual(primary.nodeId, worker.nodeId);
+
+    const a = new SwarmNode({
+      config: makeConfig({ name: "primary" }),
+      identity: primary,
+      peersPath: path.join(registry, "..", "peers-a.json"),
+      sessionsDir: path.join(registry, "..", "sessions-a"),
+      instanceDir: registry,
+      discovery: false,
+    });
+    const b = new SwarmNode({
+      config: makeConfig({ name: "worker" }),
+      identity: worker,
+      peersPath: path.join(registry, "..", "peers-b.json"),
+      sessionsDir: path.join(registry, "..", "sessions-b"),
+      instanceDir: registry,
+      discovery: false,
+    });
+    nodes.push(a, b);
+
+    const startedA = await a.start();
+    const startedB = await b.start();
+    assert.notEqual(startedA.port, startedB.port);
+    await a.stop();
+    await b.stop();
+  });
+});
+
+describe("another process holds the identity", () => {
+  it("refuses to start and names the pid", async () => {
+    const registry = instanceDir();
+    const identity = loadIdentity();
+    fs.mkdirSync(registry, { recursive: true });
+    // A live foreign pid, as a second pi process would leave behind.
+    fs.writeFileSync(
+      path.join(registry, `${identity.nodeId}.json`),
+      JSON.stringify({
+        proto: "pi-swarm/1",
+        nodeId: identity.nodeId,
+        name: "other-pi",
+        port: 47823,
+        sessionId: null,
+        accepting: true,
+        pid: process.ppid,
+        updatedAt: Date.now(),
+      }),
+    );
+
+    const node = new SwarmNode({
+      config: makeConfig({ name: "late" }),
+      identity,
+      peersPath: path.join(registry, "..", "peers-late.json"),
+      sessionsDir: path.join(registry, "..", "sessions-late"),
+      instanceDir: registry,
+      discovery: false,
+    });
+    nodes.push(node);
+
+    await assert.rejects(() => node.start(), /already runs this swarm identity.*pid \d+/s);
+  });
+});

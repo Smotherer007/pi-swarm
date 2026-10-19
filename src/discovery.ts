@@ -77,7 +77,8 @@ function parseBeacon(value: unknown): BeaconPayload | null {
   };
 }
 
-function pidAlive(pid: number): boolean {
+/** Is that process still there? EPERM means it exists but belongs to someone else. */
+export function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return true;
   try {
     process.kill(pid, 0);
@@ -126,7 +127,6 @@ export class Discovery {
   async start(): Promise<{ multicast: boolean; warnings: string[] }> {
     if (this.running) return { multicast: this.multicastActive, warnings: this.warningsList };
     this.running = true;
-    this.warnSharedIdentity();
     this.writeInstance();
 
     if (this.options.multicast) {
@@ -233,31 +233,6 @@ export class Discovery {
     const filePath = this.instancePath();
     if (!filePath) return;
     removeQuietly(filePath);
-  }
-
-  /**
-   * Two pi processes with one identity ignore each other: every beacon whose
-   * nodeId matches this node is dropped as "myself", and both would overwrite
-   * the same peer book. That is invisible and confusing, so it is said out
-   * loud at start instead.
-   */
-  private warnSharedIdentity(): void {
-    const filePath = this.instancePath();
-    if (!filePath) return;
-    try {
-      if (!fs.existsSync(filePath)) return;
-      const record = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Partial<InstanceRecord>;
-      const otherPid = Number(record.pid);
-      if (!Number.isInteger(otherPid) || otherPid === process.pid) return;
-      if (!pidAlive(otherPid)) return;
-      this.warnings.push(
-        `pid ${otherPid} on this machine already uses this swarm identity (${this.options.nodeId}).` +
-          " A second pi needs its own slot, or the two will not see each other:" +
-          " start it with PI_SWARM_INSTANCE=<name>.",
-      );
-    } catch {
-      /* an unreadable registry file costs only this warning */
-    }
   }
 
   private async tick(): Promise<void> {
