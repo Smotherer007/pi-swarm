@@ -36,3 +36,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npx semantic-release
+
+      # semantic-release reports success even when the npm plugin decides not to
+      # publish, because "skip" is a normal log line there and not an error. That
+      # is how v1.2.1 and v1.2.2 got a git tag, a GitHub release and no package on
+      # npm -- invisible until someone tried to install the version. The version
+      # in package.json is the truth after a release, so it is checked here.
+      - name: Verify the version really reached npm
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "@patimweb/pi-swarm@$VERSION" version >/dev/null 2>&1; then
+            echo "npm serves @patimweb/pi-swarm@$VERSION"
+            exit 0
+          fi
+          echo "::error::package.json is at $VERSION but npm does not serve it. The publish step above was skipped or failed silently -- check the release log for 'Skip publishing to npm registry' and the NPM_TOKEN secret."
+          exit 1
