@@ -125,6 +125,22 @@ describe("extension wiring", () => {
     assert.match(status.content[0].text ?? "", /policy: ask/);
   });
 
+  it("does not claim a restart when a settings call changes nothing", async () => {
+    // swarm_discover starts the node, so a following setup call finds a running
+    // one and must not pretend it restarted it.
+    await tools.get("swarm_discover")!.execute("call", { timeoutSeconds: 1 }, undefined, undefined, ctx);
+
+    const unchanged = await tools.get("swarm_setup")!.execute("call", {}, undefined, undefined, ctx);
+    assert.doesNotMatch(unchanged.content[0].text ?? "", /restarted/);
+    assert.equal((unchanged.details as { restarted?: boolean }).restarted, false);
+
+    const changed = await tools
+      .get("swarm_setup")!
+      .execute("call", { name: "pi@testbed" }, undefined, undefined, ctx);
+    assert.match(changed.content[0].text ?? "", /restarted/);
+    assert.equal((changed.details as { restarted?: boolean }).restarted, true);
+  });
+
   it("explains a connect attempt to an address nobody listens on", async () => {
     const result = await tools
       .get("swarm_connect")!

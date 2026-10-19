@@ -21,8 +21,10 @@
  *   swarm_file        offer, accept, list and sweep transferred files
  *   swarm_leave       stop listening
  *
- * Nothing a peer sends is treated as an instruction. The node starts with the
- * session, so an idle agent is discoverable without anyone calling a tool.
+ * A peer's message is carried as text like any other: what the agent does with
+ * it is decided by its own tool configuration, not by the swarm. The node
+ * starts with the session, so an idle agent is discoverable without anyone
+ * calling a tool.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";

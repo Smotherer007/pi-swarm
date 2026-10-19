@@ -139,10 +139,10 @@ describe("formatRequests", () => {
 });
 
 describe("formatInbox", () => {
-  it("labels peer content and warns that it is third-party text", () => {
+  it("labels peer content and says it is a request from another agent", () => {
     const text = formatInbox([message()], "s_1");
     assert.match(text, /\[peer n_peer01ab beta\]/);
-    assert.match(text, /third-party content/);
+    assert.match(text, /request from another agent/);
   });
 
   it("marks outgoing messages as from you", () => {

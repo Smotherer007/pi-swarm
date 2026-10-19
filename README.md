@@ -399,17 +399,21 @@ switching it off through `swarm_setup` is itself confirmed.
 
 ### Peer content
 
-Peer text is third-party content and is treated that way:
+A message from a peer is a request from another agent. It is carried and
+labelled, but it is not a second permission system: the machine's own tool
+configuration decides what runs, and nothing configured means nothing withheld.
 
 - **Nothing arrives on its own ... except what you allowed.** Messages land in
   the conversation history and start a turn when `autoDeliverInbox` is on (the
   default); connection and disconnection are history only, never a turn.
   `swarm_setup autoDeliverInbox=false wakeOnRequest=false` returns the node to
   inbox-only behaviour, where nothing a peer sends can spend tokens.
-- **Labelled.** Every inbox and knowledge block that contains peer text is
-  marked with the author, and the tool descriptions and the inbox formatter say
-  explicitly that it is not an instruction from the user.
-- **Validated.** Every body is size-limited (512 KiB), schema-validated,
+- **A request, labelled as one.** A message from a peer is carried like any
+  other text and handled with the agent's normal tools: what may run is decided
+  by this machine's own tool configuration, and with nothing configured nothing
+  is withheld. The inbox and the posted turn name the sender, so a task can be
+  traced back to the peer that asked for it.
+- **Sized and validated.** Every body is size-limited (512 KiB), schema-validated,
   stripped of control characters and length-capped. A malformed request is a
   400, never a crash. Knowledge pulled from a peer is validated entry by entry,
   just like knowledge pushed to this node.

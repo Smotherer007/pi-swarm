@@ -103,9 +103,25 @@ export const SwarmBroadcastTool: ToolDefinition = {
       timeoutMs: Math.min(Math.max(params.timeoutSeconds ?? 30, 5), 120) * 1000,
     });
 
+    // Nothing to ask for is not the same as nobody being there: a broadcast to
+    // peers that are already connected says so, instead of reporting an empty
+    // network.
+    const visible = node.snapshot().discovered;
+    const text =
+      outcome.attempts.length > 0
+        ? formatAttempts(outcome.attempts, outcome.warnings)
+        : visible.length > 0
+          ? [
+              `Nothing was requested: every visible peer is already connected.`,
+              ...visible.map((peer) => `- ${peer.name} (${peer.host}:${peer.port})`),
+              "",
+              "Talk with swarm_say, or connect to a specific host:port with swarm_connect.",
+            ].join("\n")
+          : formatAttempts(outcome.attempts, outcome.warnings);
+
     return {
       content: [
-        { type: "text" as const, text: formatAttempts(outcome.attempts, outcome.warnings) },
+        { type: "text" as const, text },
       ],
       details: {
         mode,
