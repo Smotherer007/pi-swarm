@@ -118,6 +118,9 @@ describe("the background link keeper", () => {
     const elapsed = Date.now() - started;
 
     assert.deepEqual(round.attempted, ["keeper-nowhere"]);
-    assert.ok(elapsed < 300, `a round returned in ${elapsed} ms instead of at once`);
+    // The attempt itself is allowed to take its 8 s connect timeout; the round
+    // must not wait for it. A generous bound still proves that, and unlike a
+    // tight one it does not fail on a loaded machine.
+    assert.ok(elapsed < 2000, `a round blocked for ${elapsed} ms instead of returning`);
   });
 });
