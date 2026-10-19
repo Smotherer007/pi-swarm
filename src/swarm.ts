@@ -1774,7 +1774,11 @@ export class SwarmNode {
       try {
         return { ok: true, value: await call(fresh), link: fresh };
       } catch (retryError) {
-        return { ok: false, error: `${(retryError as Error).message} (after reconnecting)` };
+        // A plain refusal (a scope that is gone, a policy) is the answer we
+        // want to report; only a transport failure gets the retry note.
+        const retry = retryError as Error;
+        const suffix = retryError instanceof TransportError ? " (after reconnecting)" : "";
+        return { ok: false, error: `${retry.message}${suffix}` };
       }
     }
   }
@@ -1785,6 +1789,12 @@ export class SwarmNode {
     kind: MessageKind,
   ): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
     const result = await this.withLink(connection, async (link) => {
+      // Checked on the link that actually sends: after a heal the peer may have
+      // granted less than before, and the scope from before the 401 proves
+      // nothing.
+      if (!hasScope(link.grantedToMe, "chat")) {
+        throw new Error("the peer no longer grants the chat scope to this node");
+      }
       await requestJson(`${baseUrl(link.host, link.port)}${API_PREFIX}/message`, {
         body: { id: newId("m"), text, kind, sessionId: this.sessionId },
         token: link.outToken,

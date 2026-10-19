@@ -698,6 +698,55 @@ describe("healing half a link", () => {
     assert.deepEqual(healed.grantedToPeer, ["chat"], "and so does what we granted");
     assert.ok(healed.outToken && healed.outToken !== "not-a-real-token");
 
+    // And the token the guest issued is still honoured: the host can still call
+    // it, without a heal of its own (case b of the review).
+    const hostSide = await host.say("und in die andere Richtung?");
+    assert.deepEqual(hostSide.delivered, ["halfguest"]);
+
+    await guest.stop();
+    await host.stop();
+  });
+});
+
+describe("a heal that grants less than before", () => {
+  it("re-checks the scope on the healed link instead of trusting the old one", async () => {
+    const root = tempDir("pi-swarm-scopeheal");
+    dirs.push(root);
+    const host = new SwarmNode({
+      config: makeConfig({ name: "scopehost", inboundPolicy: "known-auto" }),
+      identity: makeIdentity("scopehost"),
+      peersPath: path.join(root, "peers.json"),
+      sessionsDir: path.join(root, "sessions"),
+      instanceDir: null,
+      discovery: false,
+    });
+    nodes.push(host);
+    const guest = makeNode("scopeguest");
+    const h = await host.start();
+    await guest.start();
+
+    const connecting = guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    await waitFor(() => host.pendingRequests().length === 1);
+    host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
+    assert.equal((await connecting).status, "connected");
+
+    // The host changes its mind: from now on it hands out only knowledge:read,
+    // so the reconnect after a rotated token comes back with less than the
+    // first handshake did. Both the ceiling (defaultScopes) and the stored
+    // grant have to shrink -- either one alone still allows chat.
+    host.config.defaultScopes = ["knowledge:read"];
+    host.peers.setScopes("n_test_scopeguest", ["knowledge:read"]);
+    guest.snapshot().connections[0].outToken = "rotated";
+
+    const result = await guest.say("darf ich noch?");
+    assert.deepEqual(result.delivered, [], "no message goes out without the chat scope");
+    assert.equal(result.failed.length, 1);
+    assert.match(result.failed[0].error, /no longer grants the chat scope/);
+
     await guest.stop();
     await host.stop();
   });
