@@ -481,7 +481,7 @@ describe("an approval is the only decision a link needs", () => {
 
 describe("a link that went stale", () => {
   /** Host + guest, connected, sharing one peer book the restart can reuse. */
-  async function pair(name: string) {
+  async function pair(name: string, scopes: Scope[] = ["chat"]) {
     const root = tempDir(`pi-swarm-${name}`);
     dirs.push(root);
     const identity = makeIdentity(name);
@@ -503,12 +503,12 @@ describe("a link that went stale", () => {
     const h = await host.start();
     await guest.start();
     const connecting = guest.connect(`127.0.0.1:${h.port}`, {
-      scopes: ["chat"],
+      scopes,
       wait: true,
       timeoutMs: 10_000,
     });
     await waitFor(() => host.pendingRequests().length === 1);
-    host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
+    host.decide(host.pendingRequests()[0].requestId, true, scopes);
     const attempt = await connecting;
     assert.equal(attempt.status, "connected", attempt.reason);
 
@@ -579,5 +579,126 @@ describe("a link that went stale", () => {
     assert.equal(guest.snapshot().connections.length, 0);
 
     await guest.stop();
+  });
+});
+
+describe("knowledge over a link whose peer restarted", () => {
+  it("heals the token instead of failing the sync", async () => {
+    // Same setup as above, but with the wire for knowledge open.
+    const root = tempDir("pi-swarm-kheal");
+    dirs.push(root);
+    const identity = makeIdentity("khost");
+    const hostConfig = makeConfig({ name: "khost", inboundPolicy: "known-auto" });
+    const host = new SwarmNode({
+      config: hostConfig,
+      identity,
+      peersPath: path.join(root, "peers.json"),
+      sessionsDir: path.join(root, "sessions"),
+      instanceDir: null,
+      discovery: false,
+    });
+    nodes.push(host);
+    const guest = makeNode("kguest");
+    const h = await host.start();
+    await guest.start();
+
+    const connecting = guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat", "knowledge:read"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    await waitFor(() => host.pendingRequests().length === 1);
+    host.decide(host.pendingRequests()[0].requestId, true, ["chat", "knowledge:read"]);
+    assert.equal((await connecting).status, "connected");
+
+    await host.putKnowledge([{ key: "vorher", text: "vom Host vor dem Neustart" }]);
+    const first = await guest.syncWith(identity.nodeId);
+    assert.deepEqual(first.errors, []);
+    assert.equal(first.pulled, 1);
+
+    // Restart: same identity, same port, same peer book, brand new tokens.
+    await host.stop();
+    const restarted = new SwarmNode({
+      config: { ...hostConfig, port: h.port },
+      identity,
+      peersPath: path.join(root, "peers.json"),
+      sessionsDir: path.join(root, "sessions"),
+      instanceDir: null,
+      discovery: false,
+    });
+    nodes.push(restarted);
+    await restarted.start();
+    await restarted.putKnowledge([{ key: "nachher", text: "vom Host nach dem Neustart" }]);
+
+    const second = await guest.syncWith(identity.nodeId);
+    assert.deepEqual(second.errors, [], "the sync must not report an unknown token");
+    // The reconnect inside the heal already syncs, so the count here may be 0.
+    // What matters is that the new entry arrived at all.
+    const keys = (guest.knowledgeBase?.all() ?? []).map((entry) => entry.key);
+    assert.ok(keys.includes("vorher"), "the entry from before the restart is still there");
+    assert.ok(keys.includes("nachher"), "the entry from after the restart arrived");
+
+    await guest.stop();
+    await restarted.stop();
+  });
+});
+
+describe("healing half a link", () => {
+  it("keeps the token we issued and the scopes we granted", async () => {
+    const root = tempDir("pi-swarm-halfheal");
+    dirs.push(root);
+    const host = new SwarmNode({
+      config: makeConfig({ name: "halfhost", inboundPolicy: "known-auto" }),
+      identity: makeIdentity("halfhost"),
+      peersPath: path.join(root, "host-peers.json"),
+      sessionsDir: path.join(root, "host-sessions"),
+      instanceDir: null,
+      discovery: false,
+    });
+    nodes.push(host);
+    const guest = makeNode("halfguest");
+    const h = await host.start();
+    await guest.start();
+
+    // guest -> host
+    const forward = guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    await waitFor(() => host.pendingRequests().length === 1);
+    host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
+    assert.equal((await forward).status, "connected");
+
+    // host -> guest, so both sides hold a token the other issued
+    const back = host.connect(`127.0.0.1:${guest.port ?? 0}`, {
+      scopes: ["chat"],
+      wait: true,
+      timeoutMs: 10_000,
+    });
+    await waitFor(() => guest.pendingRequests().length === 1);
+    guest.decide(guest.pendingRequests()[0].requestId, true, ["chat"]);
+    assert.equal((await back).status, "connected");
+
+    const connection = guest.snapshot().connections[0];
+    assert.ok(connection.inToken, "the guest issued a token to the host");
+    assert.deepEqual(connection.grantedToPeer, ["chat"]);
+    const issued = connection.inToken;
+
+    // The peer rotated its tokens: what the guest holds for calling out is dead,
+    // while the token it issued is untouched.
+    connection.outToken = "not-a-real-token";
+
+    const result = await guest.say("kommt das trotzdem an?");
+    assert.deepEqual(result.delivered, ["halfhost"], "the heal delivers the message");
+    assert.deepEqual(result.failed, []);
+
+    const healed = guest.snapshot().connections[0];
+    assert.equal(healed.inToken, issued, "the token we issued survives our own heal");
+    assert.deepEqual(healed.grantedToPeer, ["chat"], "and so does what we granted");
+    assert.ok(healed.outToken && healed.outToken !== "not-a-real-token");
+
+    await guest.stop();
+    await host.stop();
   });
 });

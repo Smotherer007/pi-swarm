@@ -1741,41 +1741,80 @@ export class SwarmNode {
    * that on its own, so the message goes through without the user doing
    * anything.
    */
-  private async deliver(
+  /**
+   * Run an authenticated call against a peer, healing the link once if the peer
+   * no longer knows the token.
+   *
+   * A restart on the other side invalidates every token it ever issued, and
+   * that hits every endpoint the same way -- chat, knowledge, leave. Healing in
+   * one place keeps them all working instead of only the one that was patched
+   * last.
+   */
+  private async withLink<T>(
     connection: Connection,
-    text: string,
-    kind: MessageKind,
-  ): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+    call: (link: Connection) => Promise<T>,
+  ): Promise<{ ok: true; value: T; link: Connection } | { ok: false; error: string }> {
     try {
-      await this.postMessage(connection, text, kind);
-      connection.lastSeen = Date.now();
-      return { ok: true, name: connection.name };
+      return { ok: true, value: await call(connection), link: connection };
     } catch (err) {
-      const error = err as TransportError;
-      // 401: the peer does not know the token any more. No status: no answer.
-      const dead = error.statusCode === 401 || error.statusCode === undefined;
+      // 401: the peer forgot the token. No status: it did not answer at all.
+      // Anything else (403, 429, 500) is an answer and must not be masked by a
+      // reconnect.
+      const dead =
+        err instanceof TransportError &&
+        (err.statusCode === 401 || err.statusCode === undefined);
+      const error = err as Error;
       if (!dead) return { ok: false, error: error.message };
 
-      const why = error.statusCode === 401 ? "token rejected" : "no answer from the peer";
-      this.dropConnection(connection.nodeId, why);
+      const transport = err as TransportError;
+      const why = transport.statusCode === 401 ? "token rejected" : "no answer from the peer";
+      this.invalidateOutbound(connection, why);
       const fresh = await this.reconnect(connection).catch(() => null);
       if (!fresh) return { ok: false, error: `${error.message} (${why}; reconnecting failed)` };
       try {
-        await this.postMessage(fresh, text, kind);
-        fresh.lastSeen = Date.now();
-        return { ok: true, name: fresh.name };
+        return { ok: true, value: await call(fresh), link: fresh };
       } catch (retryError) {
         return { ok: false, error: `${(retryError as Error).message} (after reconnecting)` };
       }
     }
   }
 
-  private async postMessage(connection: Connection, text: string, kind: MessageKind): Promise<void> {
-    await requestJson(`${baseUrl(connection.host, connection.port)}${API_PREFIX}/message`, {
-      body: { id: newId("m"), text, kind, sessionId: this.sessionId },
-      token: connection.outToken,
-      timeoutMs: 6000,
+  private async deliver(
+    connection: Connection,
+    text: string,
+    kind: MessageKind,
+  ): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+    const result = await this.withLink(connection, async (link) => {
+      await requestJson(`${baseUrl(link.host, link.port)}${API_PREFIX}/message`, {
+        body: { id: newId("m"), text, kind, sessionId: this.sessionId },
+        token: link.outToken,
+        timeoutMs: 6000,
+      });
+      link.lastSeen = Date.now();
+      return link.name;
     });
+    return result.ok ? { ok: true, name: result.value } : { ok: false, error: result.error };
+  }
+
+  /**
+   * Our token to the peer is dead; the token we issued it is not.
+   *
+   * A rejected outbound token normally means the peer restarted, which says
+   * nothing about the half of the link we own. Dropping the whole connection
+   * would delete the inbound token and the scopes we granted, so the peer's
+   * next call to us would be refused for no reason, and the status would claim
+   * we granted nothing. Only the outbound half is reset here; a link with
+   * nothing inbound is a real disconnect and goes through dropConnection.
+   */
+  private invalidateOutbound(connection: Connection, reason: string): void {
+    connection.outToken = undefined;
+    connection.grantedToMe = [];
+    if (!connection.inToken) {
+      this.dropConnection(connection.nodeId, reason);
+      return;
+    }
+    // The peer may still call us with the token it already holds.
+    this.tokens.set(connection.inToken, connection.nodeId);
   }
 
   private async reconnect(connection: Connection): Promise<Connection | null> {
@@ -1912,32 +1951,40 @@ export class SwarmNode {
     if (!this.knowledge) return outcome;
 
     if (hasScope(connection.grantedToMe, "knowledge:read")) {
-      try {
-        const since = options.full ? 0 : (this.pullSince.get(nodeId) ?? 0);
+      const since = options.full ? 0 : (this.pullSince.get(nodeId) ?? 0);
+      const result = await this.withLink(connection, async (link) => {
+        if (!hasScope(link.grantedToMe, "knowledge:read")) {
+          throw new Error("the peer no longer grants knowledge:read");
+        }
         const response = await requestJson<{ entries?: unknown }>(
-          `${baseUrl(connection.host, connection.port)}${API_PREFIX}/knowledge?since=${since}&limit=100`,
-          { token: connection.outToken, timeoutMs: 5000 },
+          `${baseUrl(link.host, link.port)}${API_PREFIX}/knowledge?since=${since}&limit=100`,
+          { token: link.outToken, timeoutMs: 5000 },
         );
-        const raw = (Array.isArray(response.data?.entries) ? response.data.entries : []) as KnowledgeEntry[];
-        const merged = this.knowledge.merge(raw);
+        return (Array.isArray(response.data?.entries) ? response.data.entries : []) as KnowledgeEntry[];
+      });
+      if (result.ok) {
+        const merged = this.knowledge.merge(result.value);
         outcome.pulled = merged.added + merged.replaced;
-        const newest = raw.reduce((max, entry) => Math.max(max, Number(entry.ts) || 0), since);
+        const newest = result.value.reduce((max, entry) => Math.max(max, Number(entry.ts) || 0), since);
         this.pullSince.set(nodeId, newest);
         if (outcome.pulled > 0) {
-          this.emit({ type: "knowledge", entries: this.knowledge.since(since), from: connection });
+          this.emit({ type: "knowledge", entries: this.knowledge.since(since), from: result.link });
         }
-      } catch (err) {
-        outcome.errors.push(`${connection.name}: ${(err as Error).message}`);
+      } else {
+        outcome.errors.push(`${connection.name}: ${result.error}`);
       }
     }
 
     if (hasScope(connection.grantedToMe, "knowledge:write")) {
-      try {
-        const entries = this.knowledge.all().slice(-MAX_KNOWLEDGE_ENTRIES_PER_PUSH);
-        outcome.pushed = await this.pushKnowledgeTo(connection, entries);
-      } catch (err) {
-        outcome.errors.push(`${connection.name}: ${(err as Error).message}`);
-      }
+      const entries = this.knowledge.all().slice(-MAX_KNOWLEDGE_ENTRIES_PER_PUSH);
+      const result = await this.withLink(connection, async (link) => {
+        if (!hasScope(link.grantedToMe, "knowledge:write")) {
+          throw new Error("the peer no longer grants knowledge:write");
+        }
+        return this.pushKnowledgeTo(link, entries);
+      });
+      if (result.ok) outcome.pushed = result.value;
+      else outcome.errors.push(`${connection.name}: ${result.error}`);
     }
 
     return outcome;

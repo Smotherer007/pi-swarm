@@ -235,8 +235,14 @@ known peer marked `autoConnect` that is not connected yet:
 - one attempt per peer at a time: a second round skips a peer that is already
   being negotiated
 - a link whose peer stopped answering is dropped instead of being reported as
-  connected, and a message to a link whose token the peer no longer knows
-  (it restarted) heals itself: drop, handshake again, deliver
+  connected, and a call whose token the peer no longer knows (it restarted) is
+  retried after a fresh handshake -- for messages and for knowledge alike
+
+A link is two independent tokens, and a heal respects that: only the half that
+was rejected is reset. The token this node issued and the scopes it granted
+survive, so a peer that restarted, or a heal of our own outbound half, does not
+silently cut off the peer's access to us and does not make the status claim we
+granted nothing.
 
 Both directions are enforced: the granting side checks every request, and the
 calling side refuses to send what it was not granted instead of pretending.

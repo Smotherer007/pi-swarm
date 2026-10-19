@@ -107,7 +107,15 @@ describe("extension wiring", () => {
   it("applies settings through swarm_setup and shows them in the status", async () => {
     const setup = await tools
       .get("swarm_setup")!
-      .execute("call", { name: "pi@testbed", inboundPolicy: "ask", autoConnectKnown: true }, undefined, undefined, ctx);
+      .execute(
+        "call",
+        // discovery off: a test must not announce itself on the developer's LAN,
+        // which is exactly what a real beacon would do.
+        { name: "pi@testbed", inboundPolicy: "ask", autoConnectKnown: true, discovery: false, port: 0 },
+        undefined,
+        undefined,
+        ctx,
+      );
     assert.match(setup.content[0].text ?? "", /pi@testbed/);
     assert.match(setup.content[0].text ?? "", /auto-connect known peers: on/);
 
