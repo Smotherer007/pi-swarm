@@ -22,6 +22,14 @@ pi A ──beacon──▶ network ◀──beacon── pi B
   │◀────────── message / knowledge ───┤
 ```
 
+## Install
+
+```bash
+pi install @patimweb/pi-swarm
+# or, from this checkout
+pi --extension ~/Documents/Workspaces/pi-swarm
+```
+
 ## Quick start
 
 Both machines need the extension. Nothing listens until you use a swarm tool.
