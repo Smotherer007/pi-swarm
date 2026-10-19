@@ -301,7 +301,9 @@ for the life of a link.
 
 `POST /swarm/v1/hello` → `accepted` (token, scopes, session) | `pending`
 (request id) | `denied` (reason)
-`POST /swarm/v1/approval` → status of a request, and the token once approved
+`POST /swarm/v1/approval` → status of a request, and the token once approved.
+The body must name the requesting node id; a caller that cannot is answered as
+if the request did not exist
 `POST /swarm/v1/message` (chat) · `POST|GET /swarm/v1/knowledge`
 (read/write) · `POST /swarm/v1/peers` (introductions) ·
 `POST /swarm/v1/leave` · `GET /swarm/v1/info` (public card)
@@ -314,7 +316,7 @@ side for that specific link.
 
 ```bash
 npm install
-npm test          # 108 tests: unit, two-node handshake over loopback, in-process extension
+npm test          # 118 tests: unit, two-node handshake over loopback, in-process extension
 npm run typecheck # tsc --noEmit
 ```
 
@@ -322,10 +324,12 @@ CI runs the suite on Ubuntu (Node 22, 24, 26), macOS and Windows.
 
 The test suite starts two real nodes on loopback and walks the full handshake:
 pending before approval, token after, messages one way, knowledge both ways,
-last-write-wins merging, ban, narrowed grants, a node that disabled knowledge
-sharing, a peer reached only through a seed address, and the platform-specific
-parts of the transport (address families, IPv6 literals, port collisions,
-oversized bodies).
+last-write-wins merging, ban, narrowed grants, a token that is handed only to
+the node that asked, a node that disabled knowledge sharing, a peer reached only
+through a seed address, and the platform-specific parts of the transport
+(address families, IPv6 literals, port collisions, oversized bodies). It also
+guards the things that are not code: the skill frontmatter pi parses, the
+manifest paths, and the release pipeline.
 
 ## Limitations / next
 

@@ -131,9 +131,16 @@ export function parseHello(value: unknown): HelloRequest {
   };
 }
 
-export function parseApproval(value: unknown): { requestId: string } {
+/**
+ * An approval poll names both the request and the node collecting it. The id
+ * alone would be a bearer secret: whoever overhears it could take the token.
+ */
+export function parseApproval(value: unknown): { requestId: string; nodeId: string } {
   const record = asRecord(value, "body");
-  return { requestId: asString(record.requestId, "requestId", 80) };
+  return {
+    requestId: asString(record.requestId, "requestId", 80),
+    nodeId: asString(record.nodeId, "nodeId", 80),
+  };
 }
 
 export interface IncomingMessage {

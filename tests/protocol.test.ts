@@ -119,9 +119,13 @@ describe("parseKnowledgePush", () => {
 });
 
 describe("parseApproval and parseIntroductions", () => {
-  it("requires a request id", () => {
-    assert.equal(parseApproval({ requestId: "r_1" }).requestId, "r_1");
+  it("requires a request id and the collecting node", () => {
+    assert.deepEqual(parseApproval({ requestId: "r_1", nodeId: "n_a" }), {
+      requestId: "r_1",
+      nodeId: "n_a",
+    });
     assert.throws(() => parseApproval({}), /requestId/);
+    assert.throws(() => parseApproval({ requestId: "r_1" }), /nodeId/);
   });
 
   it("validates introduced peers", () => {

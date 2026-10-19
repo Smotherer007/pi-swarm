@@ -849,7 +849,7 @@ export class SwarmNode {
         data = (
           await requestJson<typeof data>(
             `${baseUrl(peer.host, peer.port)}${API_PREFIX}/approval`,
-            { body: { requestId }, timeoutMs: 4000 },
+            { body: { requestId, nodeId: this.identity.nodeId }, timeoutMs: 4000 },
           )
         ).data;
       } catch (err) {
@@ -1385,9 +1385,11 @@ export class SwarmNode {
   }
 
   private handleApprovalRequest(body: Buffer, res: import("node:http").ServerResponse): void {
-    const { requestId } = parseApproval(JSON.parse(body.toString("utf-8") || "{}"));
+    const { requestId, nodeId } = parseApproval(JSON.parse(body.toString("utf-8") || "{}"));
     const request = this.incoming.get(requestId);
-    if (!request) {
+    // Answer exactly as if the request were unknown: a caller that cannot name
+    // the requesting node learns nothing about who is queued here.
+    if (!request || request.from.nodeId !== nodeId) {
       sendJson(res, 200, { status: "expired", reason: "no such request (any more)" });
       return;
     }

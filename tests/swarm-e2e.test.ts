@@ -337,6 +337,48 @@ describe("swarm over the wire", () => {
     await joiner.stop();
   });
 
+  it("hands the token only to the node that asked", async () => {
+    const host = makeNode("approver");
+    const guest = makeNode("collector");
+    const h = await host.start();
+    const g = await guest.start();
+
+    const pending = await guest.connect(`127.0.0.1:${h.port}`, {
+      scopes: ["chat"],
+      wait: false,
+    });
+    assert.equal(pending.status, "pending");
+    const requestId = pending.requestId!;
+    host.decide(requestId, true, ["chat"]);
+
+    const poll = (nodeId: string) =>
+      requestJson<{ status?: string; token?: string; reason?: string }>(
+        `${baseUrl("127.0.0.1", h.port)}${API_PREFIX}/approval`,
+        { body: { requestId, nodeId } },
+      );
+
+    // A stranger holding the request id learns nothing and gets no token.
+    const intruder = await poll("n_test_intruder");
+    assert.equal(intruder.data.status, "expired");
+    assert.equal(intruder.data.token, undefined);
+    assert.equal(host.snapshot().connections.length, 0);
+
+    // The requester itself is answered, and the link exists afterwards.
+    const owner = await poll("n_test_collector");
+    assert.equal(owner.data.status, "approved");
+    assert.equal(typeof owner.data.token, "string");
+    await waitFor(() => host.snapshot().connections.length === 1);
+
+    // Polling twice is harmless: same token, one connection.
+    const again = await poll("n_test_collector");
+    assert.equal(again.data.token, owner.data.token);
+    assert.equal(host.snapshot().connections.length, 1);
+
+    void g;
+    await host.stop();
+    await guest.stop();
+  });
+
   it("rejects a second request id and unknown request ids", async () => {
     const node = makeNode("decider");
     await node.start();
