@@ -1,6 +1,6 @@
 {
   "name": "@patimweb/pi-swarm",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "pi swarm: a peer-to-peer network of pi agents. Announce, connect with consent, exchange messages and share a session knowledge board -- across machines, no central server.",
   "keywords": [
     "pi-package",
