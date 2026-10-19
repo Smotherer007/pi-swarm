@@ -14,7 +14,7 @@ import {
 } from "../src/protocol.ts";
 
 const hello = {
-  proto: "pi-swarm/1",
+  proto: "pi-swarm/2",
   from: { nodeId: "n_abc", name: "alpha" },
   sessionId: "s_1",
   scopes: ["chat", "knowledge:read"],

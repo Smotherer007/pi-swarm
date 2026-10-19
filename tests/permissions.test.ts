@@ -58,6 +58,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig(),
       known: undefined,
+      keyVerified: true,
       requested: [],
       activeConnections: 0,
     });
@@ -68,6 +69,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "open" }),
       known: knownPeer({ banned: true, trusted: true }),
+      keyVerified: true,
       requested: ["chat"],
       activeConnections: 0,
     });
@@ -79,6 +81,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ maxPeers: 2, inboundPolicy: "open" }),
       known: undefined,
+      keyVerified: true,
       requested: ["chat"],
       activeConnections: 2,
     });
@@ -90,6 +93,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "known-auto" }),
       known: undefined,
+      keyVerified: true,
       requested: ["chat"],
       activeConnections: 0,
     });
@@ -101,6 +105,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "known-auto" }),
       known: knownPeer({ trusted: false, autoConnect: false }),
+      keyVerified: true,
       requested: ["chat"],
       activeConnections: 0,
     });
@@ -112,6 +117,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "known-auto" }),
       known: knownPeer({ trusted: true, scopes: ["chat", "knowledge:read"] }),
+      keyVerified: true,
       requested: ["chat", "knowledge:read", "knowledge:write"],
       activeConnections: 0,
     });
@@ -123,6 +129,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "known-auto" }),
       known: knownPeer({ autoConnect: true }),
+      keyVerified: true,
       requested: ["chat"],
       activeConnections: 0,
     });
@@ -137,6 +144,7 @@ describe("decideInbound", () => {
         defaultScopes: ["chat", "knowledge:read", "knowledge:write"],
       }),
       known: knownPeer({ trusted: true, scopes: ["chat"] }),
+      keyVerified: true,
       requested: ["knowledge:write"],
       activeConnections: 0,
     });
@@ -148,6 +156,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "known-auto" }),
       known: knownPeer({ trusted: true, scopes: ["knowledge:write"] }),
+      keyVerified: true,
       requested: ["knowledge:write"],
       activeConnections: 0,
     });
@@ -163,6 +172,7 @@ describe("decideInbound", () => {
         defaultScopes: ["chat", "knowledge:write"],
       }),
       known: knownPeer({ trusted: true, scopes: ["knowledge:write"] }),
+      keyVerified: true,
       requested: ["knowledge:write"],
       activeConnections: 0,
     });
@@ -173,6 +183,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "open", shareKnowledge: false }),
       known: undefined,
+      keyVerified: true,
       requested: ["knowledge:read"],
       activeConnections: 0,
     });
@@ -184,6 +195,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "ask", autoGrantKnowledgeWrite: true }),
       known: knownPeer({ trusted: true }),
+      keyVerified: true,
       requested: ["knowledge:write"],
       activeConnections: 0,
     });
@@ -194,6 +206,7 @@ describe("decideInbound", () => {
     const decision = decideInbound({
       config: makeConfig({ inboundPolicy: "open", defaultScopes: ["chat", "knowledge:read"] }),
       known: undefined,
+      keyVerified: true,
       requested: ["chat", "knowledge:read", "peers:share"],
       activeConnections: 0,
     });

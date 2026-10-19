@@ -220,7 +220,7 @@ describe("another process holds the identity", () => {
     fs.writeFileSync(
       path.join(registry, `${identity.nodeId}.json`),
       JSON.stringify({
-        proto: "pi-swarm/1",
+        proto: "pi-swarm/2",
         nodeId: identity.nodeId,
         name: "other-pi",
         port: 47823,

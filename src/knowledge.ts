@@ -21,12 +21,16 @@ import type {
   KnowledgeKind,
 } from "./types.ts";
 import { MAX_KNOWLEDGE_TEXT, MAX_KEY_LENGTH } from "./types.ts";
+import * as crypto from "node:crypto";
+
 import { newId } from "./identity.ts";
-import { sanitizeText } from "./protocol.ts";
-import { sanitizeSegment } from "./paths.ts";
+import { isKnowledgeKind, sanitizeText } from "./protocol.ts";
 import { writePrivateJson } from "./fsutil.ts";
 
 const MAX_ENTRIES = 1000;
+/** An entry dated further ahead than this is refused: it would win every merge forever. */
+const MAX_FUTURE_MS = 5 * 60 * 1000;
+const NODE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,80}$/;
 
 export interface KnowledgeOptions {
   sessionId: string;
@@ -43,6 +47,27 @@ export interface MergeOutcome {
   added: number;
   replaced: number;
   ignored: number;
+  /** Ids of the entries that were added or replaced. */
+  ids: string[];
+}
+
+export interface MergeOptions {
+  /** This node's id: nobody else may write entries in its name. */
+  selfNodeId?: string;
+  /** Accept only entries authored by this node (a peer pushing in its own name). */
+  onlyAuthor?: string;
+  /** The peer that delivered the entries, recorded when it is not the author. */
+  via?: { nodeId: string; name: string };
+}
+
+/** One page of a board, in the order this node stored the entries. */
+export interface KnowledgePage {
+  /** Changes when the board is recreated, so a stale cursor starts over. */
+  epoch: string;
+  entries: KnowledgeEntry[];
+  /** Cursor for the next page: the sequence of the last entry returned. */
+  next: number;
+  more: boolean;
 }
 
 function entryId(authorNodeId: string, key: string): string {
@@ -65,10 +90,21 @@ export class KnowledgeBase {
   readonly sessionId: string;
   private readonly dir: string | null;
   private entriesById = new Map<string, KnowledgeEntry>();
+  /**
+   * Local, monotonically increasing store order. Peers pull by it rather than by
+   * the author's timestamp: an entry relayed late by a third node still has a
+   * new sequence here, so a cursor never skips it.
+   */
+  private nextSeq = 1;
+  private epochId: string = crypto.randomBytes(8).toString("hex");
 
   constructor(options: KnowledgeOptions) {
     this.sessionId = options.sessionId;
     this.dir = options.dir ?? null;
+  }
+
+  get epoch(): string {
+    return this.epochId;
   }
 
   /** Load a session board from disk, or an empty one if there is no file. */
@@ -79,9 +115,14 @@ export class KnowledgeBase {
       const file = path.join(base.dir, "knowledge.json");
       if (!fs.existsSync(file)) return base;
       const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+      if (typeof raw?.epoch === "string" && /^[a-f0-9]{16}$/.test(raw.epoch)) base.epochId = raw.epoch;
       const list: unknown[] = Array.isArray(raw?.entries) ? raw.entries : [];
-      for (const item of list) {
-        if (isEntry(item)) base.entriesById.set(item.id, item);
+      const loaded = list.filter(isEntry).sort((a, b) => (a.seq ?? a.ts) - (b.seq ?? b.ts));
+      for (const item of loaded) {
+        // A board written before sequences existed gets them in time order.
+        const seq = typeof item.seq === "number" && item.seq >= base.nextSeq ? item.seq : base.nextSeq;
+        base.entriesById.set(item.id, { ...item, seq });
+        base.nextSeq = seq + 1;
       }
     } catch {
       /* a broken file starts the session with an empty board */
@@ -121,6 +162,7 @@ export class KnowledgeBase {
       text,
       author: { nodeId: author.nodeId, name: author.name },
       ts,
+      seq: this.nextSeq++,
     };
     const replaced = this.entriesById.has(id);
     this.entriesById.set(id, entry);
@@ -129,14 +171,20 @@ export class KnowledgeBase {
     return { entry, replaced };
   }
 
-  /** Merge entries from a peer. Newer wins per id; unknown shape is dropped. */
-  merge(incoming: readonly KnowledgeEntry[]): MergeOutcome {
+  /**
+   * Merge entries from a peer. Newer wins per id; anything malformed, dated in
+   * the future, filed under another author's id, or written in a name the
+   * options forbid is dropped and counted as ignored.
+   */
+  merge(incoming: readonly KnowledgeEntry[], options: MergeOptions = {}): MergeOutcome {
     let added = 0;
     let replaced = 0;
     let ignored = 0;
+    const ids: string[] = [];
+    const now = Date.now();
 
     for (const candidate of incoming) {
-      if (!isEntry(candidate)) {
+      if (!isEntry(candidate) || !this.acceptable(candidate, options, now)) {
         ignored += 1;
         continue;
       }
@@ -150,6 +198,10 @@ export class KnowledgeBase {
         ignored += 1;
         continue;
       }
+      const via =
+        options.via && options.via.nodeId !== candidate.author.nodeId
+          ? { nodeId: options.via.nodeId, name: sanitizeText(options.via.name, 64) || "unknown" }
+          : undefined;
       this.entriesById.set(candidate.id, {
         id: candidate.id,
         sessionId: candidate.sessionId || this.sessionId,
@@ -157,11 +209,14 @@ export class KnowledgeBase {
         kind: candidate.kind,
         text,
         author: {
-          nodeId: sanitizeSegment(candidate.author.nodeId),
-          name: sanitizeText(candidate.author.name ?? "unknown", 64),
+          nodeId: candidate.author.nodeId,
+          name: sanitizeText(candidate.author.name ?? "unknown", 64) || "unknown",
         },
         ts: candidate.ts,
+        seq: this.nextSeq++,
+        ...(via ? { via } : {}),
       });
+      ids.push(candidate.id);
       if (existing) replaced += 1;
       else added += 1;
     }
@@ -170,7 +225,38 @@ export class KnowledgeBase {
       this.enforceLimit();
       this.persist();
     }
-    return { added, replaced, ignored };
+    return { added, replaced, ignored, ids };
+  }
+
+  /** Is this entry one this board may take, given who delivered it? */
+  private acceptable(entry: KnowledgeEntry, options: MergeOptions, now: number): boolean {
+    const author = entry.author.nodeId;
+    if (!NODE_ID_PATTERN.test(author)) return false;
+    if (!isKnowledgeKind(entry.kind)) return false;
+    if (!Number.isFinite(entry.ts) || entry.ts <= 0 || entry.ts > now + MAX_FUTURE_MS) return false;
+    if (options.selfNodeId && author === options.selfNodeId) return false;
+    if (options.onlyAuthor && author !== options.onlyAuthor) return false;
+    // Keyed ids are "<author>/<key>"; an entry must not claim a slot that
+    // belongs to another author, or it would overwrite that author's entry.
+    const key = sanitizeText(entry.key ?? "", MAX_KEY_LENGTH);
+    if (key && entry.id !== `${author}/${key}`) return false;
+    if (entry.id.includes("/") && !entry.id.startsWith(`${author}/`)) return false;
+    return entry.id.length <= 160;
+  }
+
+  /** Entries stored after `after`, oldest first, at most `limit` of them. */
+  page(after: number, limit: number): KnowledgePage {
+    const ordered = [...this.entriesById.values()]
+      .filter((entry) => (entry.seq ?? 0) > after)
+      .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    const entries = ordered.slice(0, limit);
+    const last = entries[entries.length - 1];
+    return {
+      epoch: this.epochId,
+      entries,
+      next: last?.seq ?? after,
+      more: ordered.length > entries.length,
+    };
   }
 
   list(options: { since?: number; kind?: KnowledgeKind; query?: string; key?: string; limit?: number } = {}): KnowledgeEntry[] {
@@ -196,6 +282,8 @@ export class KnowledgeBase {
 
   clear(): void {
     this.entriesById.clear();
+    // Peers hold a cursor into this board; a new epoch tells them to start over.
+    this.epochId = crypto.randomBytes(8).toString("hex");
     this.persist();
   }
 
@@ -210,6 +298,7 @@ export class KnowledgeBase {
     try {
       writePrivateJson(path.join(this.dir, "knowledge.json"), {
         sessionId: this.sessionId,
+        epoch: this.epochId,
         updatedAt: new Date().toISOString(),
         entries: this.all(),
       });

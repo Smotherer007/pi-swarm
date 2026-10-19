@@ -1,8 +1,9 @@
 /**
  * swarm_inbox -- read what other agents sent.
  *
- * Nothing is delivered automatically: the agent pulls, so a peer cannot fill
- * the context. Incoming text is labelled and presented as third-party data.
+ * With autoDeliverInbox (the default) a message also arrives in the
+ * conversation; the inbox is where the agent reads everything that arrived,
+ * labelled and presented as third-party data.
  */
 
 import { Type } from "typebox";

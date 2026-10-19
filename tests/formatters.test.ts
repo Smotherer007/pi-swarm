@@ -40,6 +40,7 @@ const request: IncomingRequest = {
 const snapshot: SwarmSnapshot = {
   nodeId: "n_self0123456789",
   name: "pi@lab",
+  fingerprint: "abcd 0123 abcd 0123 abcd 0123 abcd 0123",
   instance: "",
   running: false,
   port: null,

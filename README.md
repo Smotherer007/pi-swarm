@@ -5,7 +5,8 @@ A peer-to-peer network of pi agents.
 Every pi instance can announce itself on the network, ask other agents to
 connect, exchange messages, and share one session knowledge board. There is no
 server in the middle: discovery is a multicast beacon, a connection is a
-two-phase handshake, and each side decides for itself what the other may do.
+two-phase handshake, each side decides for itself what the other may do, and
+everything after discovery is encrypted end to end between the two nodes.
 
 That makes agent-to-agent orchestration possible across interfaces: a pi on your
 laptop, one in a container, one on a colleague's machine, each with its own
@@ -47,6 +48,11 @@ B: swarm_requests action=approve       -> done, for good
 #   a second request from that peer needs no decision   (known-auto)
 #   messages and connect requests land in the history and get a turn
 ```
+
+On the first contact with a stranger, compare the key fingerprint the request
+shows with the one `swarm_status` prints on the other machine (read it out, or
+send it over a channel you trust). It is pinned on approval, like an ssh host
+key, and checked on every call afterwards.
 
 Two directions, depending on who should ask whom:
 
@@ -115,8 +121,9 @@ What does still not work:
   that interface — which is exactly what you want when the swarm should stay
   inside the VPN, e.g. `swarm_setup bindHost="100.64.0.7"`.
 
-Since the transport is plain HTTP, a VPN is the right way to use the swarm
-beyond one LAN: the tunnel provides the confidentiality the protocol does not.
+Every call is encrypted and authenticated by the swarm itself (see Security),
+so a VPN is not needed for confidentiality. It is still the easy way to make
+peers *reachable* across networks, and it hides who talks to whom.
 
 ### Over SSH
 
@@ -154,12 +161,13 @@ Worth knowing:
 ## How a connection is made
 
 1. **Announce.** A node that is running sends a multicast beacon every few
-   seconds (node id, name, TCP port, session id, whether it accepts
-   connections, and an optional invitation while it broadcasts one). Two instances on one machine find each other through a small
-   per-instance registry file, because two processes cannot both own the
-   multicast port.
+   seconds (node id, name, public key, TCP port, session id, whether it accepts
+   connections, and an optional invitation while it broadcasts one). Two
+   instances on one machine find each other through a small per-instance
+   registry file, because two processes cannot both own the multicast port.
 2. **Ask.** `swarm_connect` or `swarm_broadcast` sends `/swarm/v1/hello` with
-   the scopes it wants.
+   the scopes it wants, sealed to the other node's public key (learned from its
+   beacon or from `/info`, and pinned once the other node answers).
 3. **Decide.** The receiving node answers in one of three ways:
    - *accepted*: the peer is known and the policy allows an automatic grant
    - *pending*: a request is queued and shows up in `swarm_requests`
@@ -167,8 +175,9 @@ Worth knowing:
 4. **Collect the token.** A pending request becomes a link only when the
    requester polls `/swarm/v1/approval` and receives the token the approver
    issued. An approval nobody collects leaves no half-open connection.
-5. **Use it.** Every later call carries the token, and the scope is checked
-   again on every single request.
+5. **Use it.** Every later call carries the token inside the sealed envelope,
+   the token only counts when the node it was issued to presents it, and the
+   scope is checked again on every single request.
 
 An agent only acts when its pi is working on something. A connect request now
 arrives in the conversation and starts a turn (`wakeOnRequest=true`, the
@@ -234,6 +243,10 @@ Decision policy (`swarm_setup inboundPolicy`):
 
 Automatic approval is deliberately narrow:
 
+- "known" means *known by key*: a request is treated as coming from a known
+  peer only when it was sealed with the key pinned for that peer. A node id
+  alone proves nothing -- it is in every beacon. A peer book entry without a
+  pinned key (from before encryption) needs one more decision.
 - unknown agents always wait for a decision
 - `knowledge:write` is never granted automatically unless the peer was
   explicitly given it (`swarm_peers scopes`) or `autoGrantKnowledgeWrite` is on
@@ -304,6 +317,11 @@ The rules that shape it:
   when free space drops below 200 MB, so a peer cannot quietly fill the disk.
 - `files:write` and `files:read` are never granted by default -- only an explicit
   grant per peer counts, exactly like `knowledge:write`.
+- **Ids are local.** The receiver files an offer under an id it generates
+  itself; the sender's id is validated and used only to fetch the bytes, and
+  an offer is only served to the peer it was made to.
+- **Sending is confirmed.** `swarm_file action=offer` asks the user in a dialog
+  first, so a peer message cannot talk the agent into handing out a file.
 - A ban, a forget or a token reset removes that peer's offers and the files it
   sent.
 
@@ -332,12 +350,54 @@ restarting a process.
 | `swarm_say` | send a message to one peer or to all |
 | `swarm_inbox` | read what arrived, optionally clear |
 | `swarm_knowledge` | put / list / search / sync the shared session board |
-| `swarm_peers` | trust, auto-connect, ban, forget, set stored scopes |
+| `swarm_peers` | trust, auto-connect, ban, forget, set stored scopes, show pinned keys |
+| `swarm_file` | offer a file, list / accept / decline incoming offers, list and sweep received files |
 | `swarm_leave` | disconnect everyone, stop the beacon, close the port |
 
 Commands: `/swarm`, `/swarm-broadcast`, `/swarm-leave`.
 
 ## Security
+
+### Encryption and authentication (pi-swarm/2)
+
+Everything except the public `/info` card and the beacon is sealed:
+
+- every node has a long-term **X25519** keypair, created with its identity
+- the two nodes of a pair derive one **AES-256-GCM** key per direction with
+  ECDH and HKDF-SHA256, bound to both node ids *and* both public keys
+- a request travels as a binary sealed frame; the headers carry only the
+  sender's node id and public key. The token is inside the envelope, never in a
+  header. Opening the envelope is what proves the sender holds the private key
+- the route, the sender and the recipient are authenticated data, so a captured
+  body cannot be replayed against another endpoint or another node
+- every request carries a random id and a timestamp: a repeated id, or a clock
+  more than 5 minutes off, is refused (check NTP if you see that message)
+- every answer is sealed under the other direction and bound to the request id
+  and to its status, so an old answer cannot be replayed and a denial cannot be
+  turned into an approval
+- **pinning**: the key a peer presents on the first handshake is pinned, like an
+  ssh host key. A different key later is refused (409) until the user forgets
+  the peer and approves it again. A pinned key is never replaced in passing.
+  Compare fingerprints (`swarm_status`, `swarm_requests`, `swarm_peers list`)
+  on a first contact with a stranger.
+
+What it does not do: hide that two nodes are talking (the beacon is public on
+purpose), authenticate a first contact by itself (that is the fingerprint
+compare), or give forward secrecy -- the keys are static per pair, so whoever
+steals a node's private key from `swarm-identity.json` can read recorded
+traffic of that node. Keep the file private.
+
+### Consent
+
+The decisions that hand out rights are made by the user in a dialog, not by the
+model: approving a request, trusting a peer, enabling auto-connect, widening
+its scopes, lifting a ban, opening the policy (`inboundPolicy open`,
+`autoGrantKnowledgeWrite`, `filesPolicy auto`, wider `defaultScopes`) and
+offering a file. Without a UI (print/json mode) these calls are refused. A user
+who wants headless operation sets `confirmSensitive: false` in the config file;
+switching it off through `swarm_setup` is itself confirmed.
+
+### Peer content
 
 Peer text is third-party content and is treated that way:
 
@@ -351,22 +411,24 @@ Peer text is third-party content and is treated that way:
   explicitly that it is not an instruction from the user.
 - **Validated.** Every body is size-limited (512 KiB), schema-validated,
   stripped of control characters and length-capped. A malformed request is a
-  400, never a crash.
-- **Throttled.** Per-link rate limit (`maxMessagesPerMinute`, default 40), peer
-  cap (`maxPeers`, default 8), and a cap on pending requests per address.
-- **No files, no shell, no tool execution.** The protocol carries text and
-  knowledge entries. There is deliberately no way to ask another node to run
-  something.
-- **Only what is needed is published.** A beacon carries name, node id, port,
-  session id, whether connections are accepted and the invitation text while
-  one is published — no paths, no model names, no transcript content. An
-  invitation is only a hint to the other agent; connecting is still a request.
-
-Known limitation: traffic is plain HTTP on the local network, so anyone who can
-sniff the segment can read a message or steal a token. Treat the swarm as
-something for a trusted LAN, or run it over a VPN/WireGuard interface (bind it
-with `bindHost` and connect by address). There is no TLS and no certificate
-exchange in this version.
+  400, never a crash. Knowledge pulled from a peer is validated entry by entry,
+  just like knowledge pushed to this node.
+- **Written in one's own name.** A peer with `knowledge:write` can only write
+  entries authored by itself; entries claiming this node, another author's slot
+  or a date in the future are dropped. Entries of third parties arrive only
+  from peers this node reads from, and are shown with the peer they came via.
+- **Throttled.** Per-link rate limit (`maxMessagesPerMinute`, default 40, for
+  messages, knowledge pushes, file offers and introductions), peer cap
+  (`maxPeers`, default 8), a cap on pending requests per address, and no entry
+  in the peer book for a stranger who only asked.
+- **No shell, no tool execution.** The protocol carries text, knowledge entries
+  and single files the user agreed to send. There is deliberately no way to ask
+  another node to run something.
+- **Only what is needed is published.** A beacon carries name, node id, public
+  key, port, session id, whether connections are accepted and the invitation
+  text while one is published — no paths, no model names, no transcript
+  content. An invitation is only a hint to the other agent; connecting is still
+  a request.
 
 ## Platforms
 
@@ -414,40 +476,46 @@ directory.
 | `filesPolicy` | `ask` | How an incoming file offer is decided: `ask`, `auto`, `deny` |
 | `filesMaxBytes` | `26214400` | Largest single file, enforced while the bytes arrive |
 | `filesRetentionDays` | `7` | Days a received file is kept before the sweeper removes it |
+| `confirmSensitive` | `true` | Ask the user in a dialog before rights are handed out (see Consent) |
 
 ## Files
 
 | Path | Content |
 |---|---|
-| `~/.pi/swarm-identity.json` | node id, generated once |
+| `~/.pi/swarm-identity.json` | node id and X25519 keypair, generated once -- **contains the private key** |
 | `~/.pi/swarm-config.json` | settings |
 | `~/.pi/swarm-peers.json` | peer book (trust, auto-connect, bans, stored scopes) |
 | `~/.pi/swarm/sessions/<session>/knowledge.json` | the session knowledge board |
 | `~/.pi/swarm/instances/<node>.json` | per-instance registry for this machine |
+| `~/.pi/swarm/files/<peer>/<offer>.bin` | received files, plus `index.json` |
 
-Nothing in these files is a credential beyond the node id; tokens live in memory
-for the life of a link.
+The identity file holds the node's private key; it is written `0600` where the
+platform supports modes. The peer book holds the pinned public keys. Tokens live
+in memory for the life of a link.
 
-## Wire protocol (pi-swarm/1)
+## Wire protocol (pi-swarm/2)
 
-`POST /swarm/v1/hello` → `accepted` (token, scopes, session) | `pending`
-(request id) | `denied` (reason)
-`POST /swarm/v1/approval` → status of a request, and the token once approved.
-The body must name the requesting node id; a caller that cannot is answered as
-if the request did not exist
-`POST /swarm/v1/message` (chat) · `POST|GET /swarm/v1/knowledge`
-(read/write) · `POST /swarm/v1/peers` (introductions) ·
-`POST /swarm/v1/leave` · `GET /swarm/v1/info` (public card)
+`GET /swarm/v1/info` is the only clear-text call: the public card (node id,
+name, public key, port, session, policy). Everything else is a sealed `POST` or
+`GET` with the headers `x-swarm-from` (node id) and `x-swarm-pub` (public key):
 
-All calls except `info` and the initial `hello` require
-`Authorization: Bearer <token>`, where the token was issued by the receiving
-side for that specific link.
+`/hello` → `accepted` (token, scopes, session) | `pending` (request id) |
+`denied` (reason) · `/approval` → status of a request, and the token once
+approved, only to the node and key that asked · `/message` (chat) ·
+`/knowledge` (`POST` push, `GET ?after=<seq>` pages in store order) ·
+`/files/offer`, `/files/<id>` · `/peers` (introductions) · `/leave`
+
+Request body: a sealed frame of `{v, rid, ts, token?, body?}`. Answer: a sealed
+frame bound to the request id and status. A refusal sent before the envelope
+could be opened (wrong key 409, replay 409, clock 400, unsealed 426) is plain
+JSON and is treated by the caller as unauthenticated. pi-swarm/2 does not talk
+to pi-swarm/1; both machines need the same major protocol.
 
 ## Development
 
 ```bash
 npm install
-npm test          # 118 tests: unit, two-node handshake over loopback, in-process extension
+npm test          # 186 tests: unit, crypto, two-node handshake over loopback, attacks, in-process extension
 npm run typecheck # tsc --noEmit
 ```
 
@@ -464,11 +532,14 @@ manifest paths, and the release pipeline.
 
 ## Limitations / next
 
-- plain HTTP, LAN trust model (see Security)
-- one knowledge board per node session; entries are capped at 100 per sync
-  batch and 4 000 characters each
+- no forward secrecy yet: the transport keys are static per pair of nodes; a
+  per-link ephemeral key exchange in the handshake is the next step
+- first contact is trust on first use, secured by the fingerprint compare
+- one knowledge board per node session; entries are capped at 100 per push and
+  4 000 characters each, a pull pages through the whole board
+- files are held in memory while they travel (default limit 25 MiB)
 - no relay and no rendezvous server: a peer behind NAT needs a port forward or
   a tunnel, and seeds are how a swarm spans subnets and VPNs
-- no file transfer or tool invocation between agents, by design
+- one file at a time between agents, and no tool invocation, by design
 - an invitation reaches whoever can hear the beacon; there is no targeting and
   no revocation beyond letting it expire

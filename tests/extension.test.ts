@@ -139,6 +139,21 @@ describe("extension wiring", () => {
     assert.match(result.content[0].text ?? "", /inbox is empty/);
   });
 
+  it("does not let the model open the node up without the user", async () => {
+    await assert.rejects(
+      tools.get("swarm_setup")!.execute("call", { inboundPolicy: "open" }, undefined, undefined, ctx),
+      /needs the user's confirmation/,
+    );
+    await assert.rejects(
+      tools.get("swarm_setup")!.execute("call", { confirmSensitive: false }, undefined, undefined, ctx),
+      /needs the user's confirmation/,
+    );
+    await assert.rejects(
+      tools.get("swarm_file")!.execute("call", { action: "offer", peer: "x", path: "/etc/hosts" }, undefined, undefined, ctx),
+      /needs the user's confirmation/,
+    );
+  });
+
   it("lists an empty peer book with the next step", async () => {
     const result = await tools.get("swarm_peers")!.execute("call", { action: "list" }, undefined, undefined, ctx);
     assert.match(result.content[0].text ?? "", /No known peers yet/);

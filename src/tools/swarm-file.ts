@@ -13,6 +13,7 @@ import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import { runtime } from "../runtime.ts";
+import { confirmWithUser } from "./confirm.ts";
 
 const ACTIONS = ["offer", "offers", "accept", "decline", "files", "cleanup"] as const;
 
@@ -58,6 +59,13 @@ export const SwarmFileTool: ToolDefinition = {
       case "offer": {
         if (!params.peer) throw new Error("offer needs peer=<name> and path=<file>.");
         if (!params.path) throw new Error("offer needs path=<local file>.");
+        // Handing a local file to another machine is the one action that moves
+        // the user's data out; a peer message must never be enough to cause it.
+        await confirmWithUser(
+          ctx,
+          `Send a file to ${params.peer}?`,
+          `${params.path}\nwill be offered to ${params.peer}, which can then download it once.`,
+        );
         const result = await node.offerFile(params.peer, params.path);
         const lines = result.offerId
           ? [

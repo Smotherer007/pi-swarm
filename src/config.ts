@@ -51,6 +51,7 @@ export function defaults(): SwarmConfig {
     filesPolicy: "ask",
     filesMaxBytes: DEFAULT_MAX_FILE_BYTES,
     filesRetentionDays: 7,
+    confirmSensitive: true,
   };
 }
 
@@ -195,6 +196,7 @@ export function updateConfig(
     }
     next.filesRetentionDays = value;
   }
+  if (patch.confirmSensitive !== undefined) next.confirmSensitive = Boolean(patch.confirmSensitive);
   if (patch.knowledgeRetentionDays !== undefined) {
     const value = patch.knowledgeRetentionDays;
     if (!Number.isInteger(value) || value < 0 || value > 365) {

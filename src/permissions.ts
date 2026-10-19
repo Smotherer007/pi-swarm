@@ -60,6 +60,12 @@ export interface InboundDecision {
 export interface InboundDecisionInput {
   config: SwarmConfig;
   known: KnownPeer | undefined;
+  /**
+   * True when the requester sealed its request with the key pinned for this
+   * peer. A node id alone is public (it is in every beacon), so without this
+   * "known" proves nothing and nothing stored for that peer may be used.
+   */
+  keyVerified: boolean;
   requested: readonly Scope[];
   activeConnections: number;
 }
@@ -69,13 +75,18 @@ export interface InboundDecisionInput {
  * it. "pending" means the request is queued and shows up in swarm_requests.
  */
 export function decideInbound(input: InboundDecisionInput): InboundDecision {
-  const { config, known, requested } = input;
+  const { config, requested } = input;
+  // A ban holds whatever key is presented; every privilege of a known peer
+  // needs the pinned key.
+  const banned = Boolean(input.known?.banned);
+  const known = input.keyVerified ? input.known : undefined;
+  const claimsKnown = Boolean(input.known) && !input.keyVerified;
   const policy: InboundPolicy = config.inboundPolicy;
 
   if (requested.length === 0) {
     return { decision: "deny", scopes: [], reason: "the request asked for no scopes" };
   }
-  if (known?.banned) {
+  if (banned) {
     return { decision: "deny", scopes: [], reason: "this peer is banned on this node" };
   }
   if (input.activeConnections >= config.maxPeers) {
@@ -157,8 +168,10 @@ export function decideInbound(input: InboundDecisionInput): InboundDecision {
     reason:
       policy === "ask"
         ? "inboundPolicy is ask"
-        : known
-          ? "known peer, but not trusted or set to auto-connect"
-          : "unknown peer",
+        : claimsKnown
+          ? "known peer id, but no matching encryption key is pinned for it yet -- compare the key fingerprint with its owner before approving"
+          : known
+            ? "known peer, but not trusted or set to auto-connect"
+            : "unknown peer",
   };
 }

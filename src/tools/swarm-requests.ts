@@ -11,16 +11,11 @@ import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding
 
 import { formatRequests } from "../formatting/formatters.ts";
 import { describeScopes } from "../permissions.ts";
+import { scopeSchema } from "./schema.ts";
+import { confirmWithUser } from "./confirm.ts";
+import { keyLabel } from "../formatting/formatters.ts";
 import { runtime } from "../runtime.ts";
 import type { IncomingRequest, Scope } from "../types.ts";
-
-const scopeLiterals = [
-  Type.Literal("chat"),
-  Type.Literal("knowledge:read"),
-  Type.Literal("knowledge:write"),
-  Type.Literal("peers:share"),
-  Type.Literal("session:invite"),
-];
 
 function pickRequest(node: { pendingRequests: () => IncomingRequest[] }, requestId?: string, peer?: string): IncomingRequest {
   const pending = node.pendingRequests();
@@ -37,13 +32,19 @@ function pickRequest(node: { pendingRequests: () => IncomingRequest[] }, request
   }
   if (peer) {
     const needle = peer.trim().toLowerCase();
-    const found = pending.find(
+    const exact = pending.find(
       (request) =>
         request.from.name.toLowerCase() === needle ||
         request.from.nodeId === peer.trim() ||
-        `${request.from.host}:${request.from.port}` === peer.trim() ||
-        request.from.name.toLowerCase().includes(needle),
+        `${request.from.host}:${request.from.port}` === peer.trim(),
     );
+    const partial = pending.filter((request) => request.from.name.toLowerCase().includes(needle));
+    if (!exact && partial.length > 1) {
+      throw new Error(
+        `"${peer}" matches several requests; pass requestId. Waiting: ${partial.map((r) => `${r.from.name} (${r.requestId})`).join(", ")}.`,
+      );
+    }
+    const found = exact ?? partial[0];
     if (!found) {
       throw new Error(
         pending.length > 0
@@ -76,7 +77,7 @@ export const SwarmRequestsTool: ToolDefinition = {
       Type.String({ description: "Peer name or node id, as an alternative to requestId." }),
     ),
     scopes: Type.Optional(
-      Type.Array(Type.Union(scopeLiterals), {
+      Type.Array(scopeSchema, {
         description: "On approve: the scopes to grant. Default: what was requested. Knowledge write needs an explicit grant.",
       }),
     ),
@@ -102,6 +103,18 @@ export const SwarmRequestsTool: ToolDefinition = {
     }
 
     const request = pickRequest(node, params.requestId, params.peer);
+    if (action === "approve") {
+      await confirmWithUser(
+        ctx,
+        `Approve the swarm connection from ${request.from.name}?`,
+        [
+          `${request.from.name} at ${request.from.host}:${request.from.port} (node ${request.from.nodeId})`,
+          `Key fingerprint: ${keyLabel(request.from.publicKey)}`,
+          `It would be granted: ${describeScopes(params.scopes ?? request.requestedScopes)}`,
+          "An approved peer is remembered as trusted and reconnects on its own later.",
+        ].join("\n"),
+      );
+    }
     const decided = node.decide(
       request.requestId,
       action === "approve",

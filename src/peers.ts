@@ -32,6 +32,7 @@ function coerce(raw: Partial<KnownPeer>, defaults: readonly Scope[]): KnownPeer 
   return {
     nodeId: String(raw.nodeId),
     name: String(raw.name ?? "unknown"),
+    ...(raw.publicKey ? { publicKey: String(raw.publicKey) } : {}),
     host: String(raw.host ?? ""),
     port: Number(raw.port ?? 0),
     lastSeen: Number(raw.lastSeen ?? 0),
@@ -86,11 +87,14 @@ export class PeerStore {
   byName(name: string): KnownPeer | undefined {
     const needle = name.trim().toLowerCase();
     if (!needle) return undefined;
-    return (
+    const exact =
       this.list().find((peer) => peer.name.toLowerCase() === needle) ??
-      this.list().find((peer) => peer.nodeId === name.trim()) ??
-      this.list().find((peer) => peer.name.toLowerCase().includes(needle))
-    );
+      this.list().find((peer) => peer.nodeId === name.trim());
+    if (exact) return exact;
+    // A partial name only counts when it is unambiguous: "work" must not ban
+    // whichever of "pi@workshop" and "pi@work-laptop" happens to sort first.
+    const partial = this.list().filter((peer) => peer.name.toLowerCase().includes(needle));
+    return partial.length === 1 ? partial[0] : undefined;
   }
 
   count(): number {
@@ -112,6 +116,9 @@ export class PeerStore {
         ...ref,
         ...patch,
         lastSeen: Date.now(),
+        // A pinned key is never replaced in passing: only forgetting the peer
+        // unpins it, so no code path can re-pin a key by accident.
+        publicKey: existing?.publicKey ?? patch.publicKey ?? ref.publicKey,
       },
       this.defaultScopes,
     );
@@ -127,7 +134,7 @@ export class PeerStore {
   update(nodeId: string, patch: Partial<KnownPeer>): KnownPeer {
     const existing = this.peers.get(nodeId);
     if (!existing) throw new Error(`Unknown peer "${nodeId}". Use swarm_peers list to see known peers.`);
-    const next = coerce({ ...existing, ...patch }, this.defaultScopes);
+    const next = coerce({ ...existing, ...patch, publicKey: existing.publicKey }, this.defaultScopes);
     if (next.banned) {
       next.trusted = false;
       next.autoConnect = false;

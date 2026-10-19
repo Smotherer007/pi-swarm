@@ -6,7 +6,8 @@
  * tool details objects, so no layer invents its own shape.
  */
 
-export const PROTOCOL = "pi-swarm/1";
+/** pi-swarm/2: every call except /info is sealed (see envelope.ts). Not compatible with /1. */
+export const PROTOCOL = "pi-swarm/2";
 export const API_PREFIX = "/swarm/v1";
 
 /** Fixed multicast port. Individual peers listen here, their HTTP port is advertised. */
@@ -107,11 +108,19 @@ export interface SwarmConfig {
   filesMaxBytes: number;
   /** Days a received file is kept before the sweeper removes it. */
   filesRetentionDays: number;
+  /**
+   * Ask the user (a UI dialog, not the model) before rights are handed out:
+   * approving a request, trusting a peer, widening scopes, opening the policy,
+   * offering a file. Off only by the user's own choice.
+   */
+  confirmSensitive: boolean;
 }
 
 /** The public part of a peer: everything needed to reach it. */
 export interface PeerRef {
   nodeId: string;
+  /** X25519 public key the peer presented, base64 SPKI. */
+  publicKey?: string;
   name: string;
   host: string;
   port: number;
@@ -120,6 +129,8 @@ export interface PeerRef {
 export type PeerState = "discovered" | "requested" | "pending" | "connected" | "denied";
 
 export interface DiscoveredPeer extends PeerRef {
+  /** X25519 public key the peer announced, base64 SPKI. */
+  publicKey?: string;
   /** Unix ms of the last beacon. */
   lastSeen: number;
   sessionId: string | null;
@@ -137,6 +148,8 @@ export interface DiscoveredPeer extends PeerRef {
 export interface KnownPeer {
   nodeId: string;
   name: string;
+  /** Pinned X25519 public key, base64 SPKI. Set on the first approval. */
+  publicKey?: string;
   host: string;
   port: number;
   /** Last time this peer was reachable, unix ms. */
@@ -235,6 +248,10 @@ export interface KnowledgeEntry {
     name: string;
   };
   ts: number;
+  /** Local store order on the node that holds the entry; peers pull by it. */
+  seq?: number;
+  /** The peer that delivered the entry, when that is not its author. */
+  via?: { nodeId: string; name: string };
 }
 
 export interface KnowledgeInput {
@@ -251,6 +268,8 @@ export interface ConnectAttempt {
   sessionId?: string;
   requestId?: string;
   reason: string;
+  /** Fingerprint of the key pinned for the peer, so the user can compare it. */
+  fingerprint?: string;
 }
 
 export interface SendOutcome {

@@ -12,10 +12,18 @@ import * as os from "node:os";
 
 import { identityFilePath, instanceSlug } from "./paths.ts";
 import { writePrivateJson } from "./fsutil.ts";
+import { isUsableKeyPair, newKeyPair } from "./crypto.ts";
+import type { KeyPair } from "./crypto.ts";
 
 export interface Identity {
   nodeId: string;
   createdAt: string;
+  /**
+   * Long-term X25519 keypair. It is created with the identity and kept with
+   * it, because peers pin the public half: a new pairing on every start would
+   * make every contact look like a changed key.
+   */
+  keys: KeyPair;
 }
 
 export function newNodeId(): string {
@@ -32,7 +40,7 @@ export function newToken(): string {
 }
 
 function generate(): Identity {
-  return { nodeId: newNodeId(), createdAt: new Date().toISOString() };
+  return { nodeId: newNodeId(), createdAt: new Date().toISOString(), keys: newKeyPair() };
 }
 
 function writeIdentity(identity: Identity, filePath: string): void {
@@ -44,11 +52,17 @@ export function loadIdentity(filePath: string = identityFilePath()): Identity {
     if (fs.existsSync(filePath)) {
       const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
       if (raw && typeof raw === "object" && typeof raw.nodeId === "string" && raw.nodeId) {
-        return {
-          nodeId: raw.nodeId,
+        const record = raw as { nodeId: string; createdAt?: unknown; keys?: unknown };
+        const identity: Identity = {
+          nodeId: record.nodeId,
           createdAt:
-            typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString(),
+            typeof record.createdAt === "string" ? record.createdAt : new Date().toISOString(),
+          // An identity written before encryption existed gets its keypair on
+          // the next start and keeps its nodeId, so existing pairings survive.
+          keys: isUsableKeyPair(record.keys) ? record.keys : newKeyPair(),
         };
+        if (!isUsableKeyPair(record.keys)) writeIdentity(identity, filePath);
+        return identity;
       }
     }
   } catch {

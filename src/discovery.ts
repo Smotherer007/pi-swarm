@@ -22,11 +22,14 @@ import * as path from "node:path";
 import type { DiscoveredPeer } from "./types.ts";
 import { DISCOVERY_PORT, MULTICAST_GROUP, PROTOCOL } from "./types.ts";
 import { removeQuietly, writePrivateFile } from "./fsutil.ts";
+import { sanitizeText } from "./protocol.ts";
 
 export interface BeaconPayload {
   proto: string;
   nodeId: string;
   name: string;
+  /** X25519 public key, base64 SPKI. Public on purpose: it is not a secret. */
+  pub?: string;
   port: number;
   sessionId: string | null;
   accepting: boolean;
@@ -37,6 +40,7 @@ export interface BeaconPayload {
 export interface DiscoveryOptions {
   nodeId: string;
   name: string;
+  publicKey?: string;
   /** TCP port the swarm endpoint listens on. */
   port: number;
   sessionId: string | null;
@@ -66,13 +70,14 @@ function parseBeacon(value: unknown): BeaconPayload | null {
   return {
     proto: PROTOCOL,
     nodeId: record.nodeId,
-    name: typeof record.name === "string" ? record.name.slice(0, 64) : "unknown",
+    name: typeof record.name === "string" ? sanitizeText(record.name, 64) || "unknown" : "unknown",
+    ...(typeof record.pub === "string" && record.pub && record.pub.length <= 128 ? { pub: record.pub } : {}),
     port,
     sessionId: typeof record.sessionId === "string" ? record.sessionId.slice(0, 80) : null,
     accepting: record.accepting !== false,
     invitation:
       typeof record.invitation === "string" && record.invitation
-        ? record.invitation.slice(0, 200)
+        ? sanitizeText(record.invitation, 200) || undefined
         : undefined,
   };
 }
@@ -199,6 +204,7 @@ export class Discovery {
       proto: PROTOCOL,
       nodeId: this.options.nodeId,
       name: this.options.name,
+      ...(this.options.publicKey ? { pub: this.options.publicKey } : {}),
       port: this.port,
       sessionId: this.sessionId,
       accepting: this.accepting,
@@ -282,6 +288,7 @@ export class Discovery {
         this.options.onPeer({
           nodeId: beacon.nodeId,
           name: beacon.name,
+          ...(beacon.pub ? { publicKey: beacon.pub } : {}),
           host: "127.0.0.1",
           port: beacon.port,
           lastSeen: now,
@@ -361,6 +368,7 @@ export class Discovery {
         this.options.onPeer({
           nodeId: beacon.nodeId,
           name: beacon.name,
+          ...(beacon.pub ? { publicKey: beacon.pub } : {}),
           host: rinfo.address,
           port: beacon.port,
           lastSeen: Date.now(),

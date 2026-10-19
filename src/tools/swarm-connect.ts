@@ -10,16 +10,9 @@ import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import { formatAttempts } from "../formatting/formatters.ts";
+import { scopeSchema } from "./schema.ts";
 import { runtime } from "../runtime.ts";
 import type { Scope } from "../types.ts";
-
-const scopeLiterals = [
-  Type.Literal("chat"),
-  Type.Literal("knowledge:read"),
-  Type.Literal("knowledge:write"),
-  Type.Literal("peers:share"),
-  Type.Literal("session:invite"),
-];
 
 export const SwarmConnectTool: ToolDefinition = {
   name: "swarm_connect",
@@ -29,7 +22,7 @@ export const SwarmConnectTool: ToolDefinition = {
   parameters: Type.Object({
     peer: Type.String({ description: "Peer name, node id, or host:port." }),
     scopes: Type.Optional(
-      Type.Array(Type.Union(scopeLiterals), {
+      Type.Array(scopeSchema, {
         description:
           "Scopes to ask for. Default: the scopes stored for a known peer, otherwise the configured default scopes.",
       }),

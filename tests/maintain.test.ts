@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import * as path from "node:path";
 
 import { SwarmNode } from "../src/swarm.ts";
-import { makeConfig, makeIdentity, rmrf, tempDir, waitFor } from "./helpers.ts";
+import { makeConfig, makeIdentity, pubOf, rmrf, tempDir, waitFor } from "./helpers.ts";
 
 const dirs: string[] = [];
 const nodes: SwarmNode[] = [];
@@ -56,11 +56,11 @@ describe("the background link keeper", () => {
     // The guest knows the host and is allowed to dial it; the host trusts the
     // guest, so the handshake needs no human in the loop.
     guest.peers.touch(
-      { nodeId: "n_test_keeper-host", name: "keeper-host", host: "127.0.0.1", port: 1 },
+      { nodeId: "n_test_keeper-host", publicKey: pubOf("keeper-host"), name: "keeper-host", host: "127.0.0.1", port: 1 },
       { trusted: true, autoConnect: true, scopes: ["chat"] },
     );
     host.peers.touch(
-      { nodeId: "n_test_keeper-guest", name: "keeper-guest", host: "127.0.0.1", port: 1 },
+      { nodeId: "n_test_keeper-guest", publicKey: pubOf("keeper-guest"), name: "keeper-guest", host: "127.0.0.1", port: 1 },
       { trusted: true, scopes: ["chat"] },
     );
 
@@ -84,7 +84,7 @@ describe("the background link keeper", () => {
 
     const guest = build({ name: "keeper-waiter" });
     guest.peers.touch(
-      { nodeId: "n_test_keeper-late", name: "keeper-late", host: "127.0.0.1", port: latePort },
+      { nodeId: "n_test_keeper-late", publicKey: pubOf("keeper-late"), name: "keeper-late", host: "127.0.0.1", port: latePort },
       { trusted: true, autoConnect: true, scopes: ["chat"] },
     );
     await guest.start();
@@ -95,7 +95,7 @@ describe("the background link keeper", () => {
 
     const late = build({ name: "keeper-late", port: latePort });
     late.peers.touch(
-      { nodeId: "n_test_keeper-waiter", name: "keeper-waiter", host: "127.0.0.1", port: 1 },
+      { nodeId: "n_test_keeper-waiter", publicKey: pubOf("keeper-waiter"), name: "keeper-waiter", host: "127.0.0.1", port: 1 },
       { trusted: true, scopes: ["chat"] },
     );
     await late.start();
@@ -108,7 +108,7 @@ describe("the background link keeper", () => {
   it("does not block while a link is being negotiated", async () => {
     const guest = build({ name: "keeper-nonblocking" });
     guest.peers.touch(
-      { nodeId: "n_test_keeper-nowhere", name: "keeper-nowhere", host: "127.0.0.1", port: 1 },
+      { nodeId: "n_test_keeper-nowhere", publicKey: pubOf("keeper-nowhere"), name: "keeper-nowhere", host: "127.0.0.1", port: 1 },
       { trusted: true, autoConnect: true, scopes: ["chat"] },
     );
     await guest.start();
@@ -149,11 +149,11 @@ describe("a link that only came in", () => {
 
     // Make each side known to the other, as an approval would.
     host.peers.touch(
-      { nodeId: "n_test_half-guest", name: "half-guest", host: "127.0.0.1", port: guest.port ?? 1 },
+      { nodeId: "n_test_half-guest", publicKey: pubOf("half-guest"), name: "half-guest", host: "127.0.0.1", port: guest.port ?? 1 },
       { trusted: true, autoConnect: true, scopes: ["chat"] },
     );
     guest.peers.touch(
-      { nodeId: "n_test_half-host", name: "half-host", host: "127.0.0.1", port: startedHost.port },
+      { nodeId: "n_test_half-host", publicKey: pubOf("half-host"), name: "half-host", host: "127.0.0.1", port: startedHost.port },
       { trusted: true, scopes: ["chat"] },
     );
 

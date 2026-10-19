@@ -8,6 +8,8 @@ import * as path from "node:path";
 
 import { defaults } from "../src/config.ts";
 import type { Identity } from "../src/identity.ts";
+import { newKeyPair } from "../src/crypto.ts";
+import type { KeyPair } from "../src/crypto.ts";
 import type { SwarmConfig } from "../src/types.ts";
 
 export function tempDir(prefix: string): string {
@@ -26,8 +28,49 @@ export function makeConfig(overrides: Partial<SwarmConfig> = {}): SwarmConfig {
   };
 }
 
+const keyCache = new Map<string, KeyPair>();
+
+/**
+ * A deterministic identity for a suffix.
+ *
+ * The keys are generated once per suffix and reused, because a restarted node
+ * must present the same public key -- peers pin it, and a different key on every
+ * construction would look like a stolen identity.
+ */
 export function makeIdentity(suffix: string): Identity {
-  return { nodeId: `n_test_${suffix}`, createdAt: new Date().toISOString() };
+  let keys = keyCache.get(suffix);
+  if (!keys) {
+    keys = newKeyPair();
+    keyCache.set(suffix, keys);
+  }
+  return { nodeId: `n_test_${suffix}`, createdAt: new Date().toISOString(), keys };
+}
+
+/** The public key a test identity presents, as a peer would pin it. */
+export function pubOf(suffix: string): string {
+  return makeIdentity(suffix).keys.publicKey;
+}
+
+/**
+ * One sealed call as an arbitrary identity, for tests that act as a peer --
+ * or as an intruder -- without a whole node behind them.
+ */
+export async function sealedCallAs(
+  caller: Identity,
+  target: { nodeId: string; publicKey: string; port: number },
+  route: string,
+  options: { method?: "GET" | "POST"; token?: string; body?: unknown } = {},
+): Promise<{ status: number; data: any }> {
+  const { deriveKeys } = await import("../src/crypto.ts");
+  const { sealedRequest } = await import("../src/envelope.ts");
+  const keys = deriveKeys(caller.keys, target.publicKey, caller.nodeId, target.nodeId);
+  return sealedRequest(
+    `http://127.0.0.1:${target.port}/swarm/v1${route}`,
+    keys,
+    { nodeId: caller.nodeId, publicKey: caller.keys.publicKey },
+    target.nodeId,
+    options,
+  );
 }
 
 export async function waitFor(

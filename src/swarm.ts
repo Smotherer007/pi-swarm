@@ -66,18 +66,30 @@ import {
   parseApproval,
   parseHello,
   parseIntroductions,
+  parseKnowledgePage,
   parseKnowledgePush,
   parseMessage,
   sanitizeText,
 } from "./protocol.ts";
 import { Discovery, pidAlive } from "./discovery.ts";
-import { displayName, FileStore, newOfferId } from "./files.ts";
+import { deriveKeys, fingerprint, isValidPublicKey } from "./crypto.ts";
+import type { DirectionKeys } from "./crypto.ts";
+import {
+  HEADER_FROM,
+  HEADER_PUB,
+  openRequest,
+  ReplayGuard,
+  sealedDownloadToFile,
+  sealedRequest,
+  SealedResponse,
+} from "./envelope.ts";
+import type { SealedRequestOptions } from "./envelope.ts";
+import { displayName, FileStore, isValidOfferId, newOfferId } from "./files.ts";
 import type { IncomingOffer } from "./files.ts";
 import * as crypto from "node:crypto";
 
 import {
   baseUrl,
-  downloadToFile,
   requestJson,
   sendJson,
   startHttpServer,
@@ -136,6 +148,8 @@ export interface StartResult {
 export interface SwarmSnapshot {
   nodeId: string;
   name: string;
+  /** Fingerprint of this node's public key, for a first-contact compare. */
+  fingerprint: string;
   /** The instance slot (PI_SWARM_INSTANCE), empty for the primary instance. */
   instance: string;
   running: boolean;
@@ -157,6 +171,16 @@ export interface SwarmSnapshot {
   invitation: string | null;
   multicast: boolean;
   warnings: string[];
+}
+
+/** A request whose envelope was opened: who sealed it, with which key, and what it carries. */
+interface SealedCall {
+  keys: DirectionKeys;
+  token: string | undefined;
+  inner: unknown;
+  from: string;
+  pub: string;
+  rid: string;
 }
 
 interface RateWindow {
@@ -219,8 +243,12 @@ export class SwarmNode {
   private readonly autoConnecting = new Set<string>();
   private maintainTimer: NodeJS.Timeout | null = null;
   private readonly maintainIntervalMs: number;
-  /** Highest knowledge timestamp already pulled from each peer. */
-  private pullSince = new Map<string, number>();
+  /** Knowledge cursor per peer: the board epoch and the last sequence pulled. */
+  private pullSince = new Map<string, { epoch: string; seq: number }>();
+  /** Request ids already served, so a captured request cannot be replayed. */
+  private readonly replay = new ReplayGuard();
+  /** Derived transport keys per (peer, public key); ECDH is not free. */
+  private readonly keyCache = new Map<string, DirectionKeys>();
   private seenInvitation = new Map<string, string>();
   private invitation: string | null = null;
   private invitationUntil = 0;
@@ -332,6 +360,7 @@ export class SwarmNode {
       this.discovery = new Discovery({
         nodeId: this.identity.nodeId,
         name: this.config.name,
+        publicKey: this.identity.keys.publicKey,
         port: handle.port,
         sessionId: this.sessionId,
         accepting: this.accepting(),
@@ -378,8 +407,7 @@ export class SwarmNode {
       connections
         .filter((connection) => connection.outToken)
         .map((connection) =>
-          requestJson(`${baseUrl(connection.host, connection.port)}${API_PREFIX}/leave`, {
-            method: "POST",
+          this.call(connection, "/leave", {
             token: connection.outToken,
             body: { reason },
             timeoutMs: 1000,
@@ -621,6 +649,11 @@ export class SwarmNode {
     this.expireInvitation();
     const known = this.peers.get(peer.nodeId);
     if (known?.banned) return;
+    // A beacon is unauthenticated. One that names a pinned peer with another
+    // key is either a reinstall or a spoof; neither may move that peer's entry.
+    if (known?.publicKey && peer.publicKey && peer.publicKey !== known.publicKey) return;
+    // A flood of made-up node ids must not grow the table without bound.
+    if (!this.seen.has(peer.nodeId) && this.seen.size >= 256) return;
 
     this.seen.set(peer.nodeId, peer);
 
@@ -797,22 +830,33 @@ export class SwarmNode {
         : target;
 
     const response = await requestJson<{
+      proto?: string;
       nodeId?: string;
       name?: string;
+      pub?: string;
       port?: number;
       sessionId?: string | null;
       accepting?: boolean;
       invitation?: string;
     }>(`${baseUrl(peer.host, peer.port)}${API_PREFIX}/info`, { timeoutMs: 2500 });
     const data = response.data ?? {};
-    if (typeof data.nodeId !== "string" || !data.nodeId) {
+    if (typeof data.nodeId !== "string" || !/^[A-Za-z0-9._:-]{1,80}$/.test(data.nodeId)) {
       throw new TransportError("the address did not answer like a swarm node");
+    }
+    if (data.proto !== PROTOCOL) {
+      throw new TransportError(
+        `the node there speaks ${typeof data.proto === "string" ? data.proto : "an unknown protocol"}, ` +
+          `this one speaks ${PROTOCOL} (encrypted); update pi-swarm on both machines`,
+      );
     }
     const discovered: DiscoveredPeer = {
       nodeId: data.nodeId,
-      name: typeof data.name === "string" ? data.name : peer.name,
+      name: typeof data.name === "string" ? sanitizeText(data.name, 64) || peer.name : peer.name,
+      ...(isValidPublicKey(data.pub) ? { publicKey: data.pub } : {}),
       host: peer.host,
-      port: typeof data.port === "number" ? data.port : peer.port,
+      // The address that answered is the address that works: behind a tunnel
+      // or a port forward, the port the peer believes it has is not this one.
+      port: peer.port,
       lastSeen: Date.now(),
       sessionId: typeof data.sessionId === "string" ? data.sessionId : null,
       accepting: data.accepting !== false,
@@ -920,13 +964,21 @@ export class SwarmNode {
       };
     }
 
-    return this.connectPeer(peer, {
-      scopes: options.scopes,
-      message: options.message,
-      wait: options.wait,
-      timeoutMs: options.timeoutMs,
-      intent: options.intent,
-    });
+    return this.withFingerprint(
+      await this.connectPeer(peer, {
+        scopes: options.scopes,
+        message: options.message,
+        wait: options.wait,
+        timeoutMs: options.timeoutMs,
+        intent: options.intent,
+      }),
+    );
+  }
+
+  /** Attach the fingerprint of the key pinned for the attempt's peer, if any. */
+  private withFingerprint(attempt: ConnectAttempt): ConnectAttempt {
+    const pinned = attempt.peer.nodeId ? this.peers.get(attempt.peer.nodeId)?.publicKey : undefined;
+    return pinned ? { ...attempt, fingerprint: fingerprint(pinned) } : attempt;
   }
 
   private resolveScopes(peer: PeerRef, requested?: Scope[]): Scope[] {
@@ -939,7 +991,7 @@ export class SwarmNode {
   }
 
   private async connectPeer(
-    peer: PeerRef,
+    peerInput: PeerRef,
     options: {
       scopes?: Scope[];
       message?: string;
@@ -948,6 +1000,49 @@ export class SwarmNode {
       intent?: string;
     } = {},
   ): Promise<ConnectAttempt> {
+    let peer = peerInput;
+
+    // A handshake needs the peer's public key to seal its first request. When it
+    // is not known yet -- a plain host:port, a seed, a peer added by hand -- ask
+    // the peer itself, which is also where a changed port would show up.
+    if (!peer.nodeId || !this.keysForPeer(peer)) {
+      let probed: DiscoveredPeer;
+      try {
+        probed = await this.probe({ ...peer });
+      } catch (err) {
+        return {
+          peer,
+          status: "unreachable",
+          scopes: [],
+          reason: `could not ask ${peer.host}:${peer.port} who it is: ${(err as Error).message}`,
+        };
+      }
+      if (peer.nodeId && probed.nodeId !== peer.nodeId) {
+        return {
+          peer,
+          status: "unreachable",
+          scopes: [],
+          reason: `${peer.host}:${peer.port} answers as a different node (${probed.nodeId}) than expected`,
+        };
+      }
+      // The address stays the one that was dialed: behind a tunnel or a port
+      // forward the peer's own idea of its port is not where it is reached.
+      peer = {
+        ...peer,
+        nodeId: probed.nodeId,
+        name: peer.name === `${peer.host}:${peer.port}` ? probed.name : peer.name,
+        ...(probed.publicKey ? { publicKey: probed.publicKey } : {}),
+      };
+      if (this.peers.get(peer.nodeId)?.banned) {
+        return {
+          peer,
+          status: "denied",
+          scopes: [],
+          reason: "this peer is banned on this node (swarm_peers unban to allow it again)",
+        };
+      }
+    }
+
     const existing = peer.nodeId ? this.connections.get(peer.nodeId) : undefined;
     if (existing && existing.outToken) {
       // Asking for scopes the link does not hold needs a new handshake: the
@@ -1018,17 +1113,29 @@ export class SwarmNode {
       port: this.server?.port ?? DEFAULT_PORT,
     };
 
-    let response: { status?: string; token?: string; scopes?: unknown; sessionId?: string; requestId?: string; reason?: string; nodeId?: string; name?: string; port?: number };
+    let response: {
+      status?: string;
+      token?: string;
+      scopes?: unknown;
+      sessionId?: string;
+      requestId?: string;
+      reason?: string;
+      nodeId?: string;
+      name?: string;
+      port?: number;
+    };
+    // The key this hello is sealed to. Whoever opens it and answers sealed
+    // holds the private half -- which is what pins it below.
+    const usedKey = this.peers.get(peer.nodeId)?.publicKey ?? peer.publicKey;
     try {
-      response = (
-        await requestJson<typeof response>(
-          `${baseUrl(peer.host, peer.port)}${API_PREFIX}/hello`,
-          { body, timeoutMs: options.timeoutMs ?? 6000 },
-        )
-      ).data;
+      const answer = await this.call<typeof response>(peer, "/hello", {
+        body,
+        timeoutMs: options.timeoutMs ?? 6000,
+      });
+      response = answer.data;
     } catch (err) {
       const error = err as TransportError;
-      if (error.statusCode === 403) {
+      if (error.statusCode === 403 || error.statusCode === 409 || error.statusCode === 426) {
         return { peer, status: "denied", scopes: [], reason: error.message };
       }
       return { peer, status: "unreachable", scopes: [], reason: error.message };
@@ -1036,6 +1143,24 @@ export class SwarmNode {
 
     if (response?.status === "denied") {
       return { peer, status: "denied", scopes: [], reason: response.reason ?? "denied by the peer" };
+    }
+
+    if (response?.nodeId && response.nodeId !== peer.nodeId) {
+      return {
+        peer,
+        status: "denied",
+        scopes: [],
+        reason: "the peer answered under a different node id than the one it was reached as",
+      };
+    }
+
+    // Pin the key before any token is trusted: from here on, a different key
+    // means a different peer.
+    if (response?.status === "pending" || response?.status === "accepted") {
+      const pinned = this.pinKey(peer, usedKey);
+      if (!pinned.ok) {
+        return { peer, status: "denied", scopes: [], reason: pinned.reason };
+      }
     }
 
     if (response?.status === "pending" && response.requestId) {
@@ -1112,12 +1237,11 @@ export class SwarmNode {
         reason?: string;
       };
       try {
-        data = (
-          await requestJson<typeof data>(
-            `${baseUrl(peer.host, peer.port)}${API_PREFIX}/approval`,
-            { body: { requestId, nodeId: this.identity.nodeId }, timeoutMs: 4000 },
-          )
-        ).data;
+        const answer = await this.call<typeof data>(peer, "/approval", {
+          body: { requestId, nodeId: this.identity.nodeId },
+          timeoutMs: 4000,
+        });
+        data = answer.data;
       } catch (err) {
         return {
           peer,
@@ -1203,13 +1327,15 @@ export class SwarmNode {
         continue;
       }
       attempts.push(
-        await this.connectPeer(candidate, {
-          scopes: options.scopes,
-          message: options.message,
-          wait: options.wait,
-          timeoutMs: options.timeoutMs,
-          intent: "broadcast",
-        }),
+        this.withFingerprint(
+          await this.connectPeer(candidate, {
+            scopes: options.scopes,
+            message: options.message,
+            wait: options.wait,
+            timeoutMs: options.timeoutMs,
+            intent: "broadcast",
+          }),
+        ),
       );
     }
     return { attempts, warnings: discovery.warnings };
@@ -1229,11 +1355,16 @@ export class SwarmNode {
   }): Connection {
     const existing = this.connections.get(input.nodeId);
     const now = Date.now();
+    // The address of a link is where this node reaches the peer. An inbound
+    // handshake only says where the peer *thinks* it listens, which behind an
+    // SSH tunnel, a port forward or a container mapping is not reachable from
+    // here -- so it must not move an outbound half that works.
+    const keepAddress = input.direction === "in" && Boolean(existing?.outToken);
     const connection: Connection = {
       nodeId: input.nodeId,
       name: input.name || existing?.name || "unknown",
-      host: input.host,
-      port: input.port,
+      host: keepAddress && existing ? existing.host : input.host,
+      port: keepAddress && existing ? existing.port : input.port,
       sessionId: input.sessionId || existing?.sessionId || this.sessionId || "",
       inToken: input.inToken ?? existing?.inToken,
       outToken: input.outToken ?? existing?.outToken,
@@ -1260,10 +1391,11 @@ export class SwarmNode {
     const connection = this.connections.get(nodeId);
     if (!connection) return false;
     if (connection.outToken) {
-      await requestJson(
-        `${baseUrl(connection.host, connection.port)}${API_PREFIX}/leave`,
-        { method: "POST", token: connection.outToken, body: { reason }, timeoutMs: 1000 },
-      ).catch(() => {
+      await this.call(connection, "/leave", {
+        token: connection.outToken,
+        body: { reason },
+        timeoutMs: 1000,
+      }).catch(() => {
         /* the peer may already be gone */
       });
     }
@@ -1296,18 +1428,21 @@ export class SwarmNode {
 
   // --------------------------------------------------------------- inbound side
 
-  private authorize(
-    req: { headers: { authorization?: string | string[] } },
-  ): Connection | null {
-    const header = req.headers.authorization;
-    const value = Array.isArray(header) ? header[0] : header;
-    if (!value || !value.startsWith("Bearer ")) return null;
-    const token = value.slice("Bearer ".length).trim();
+  /**
+   * The link a sealed call belongs to, or null.
+   *
+   * The token comes out of the sealed envelope, and it only counts when the node
+   * that sealed the call is the node it was issued to: a token is bound to its
+   * peer, not a bearer secret anybody could present.
+   */
+  private authorize(sealed: { token?: string | undefined; from: string; pub: string }): Connection | null {
+    const token = sealed.token;
     if (!token) return null;
     const nodeId = this.tokens.get(token);
-    if (!nodeId) return null;
+    if (!nodeId || nodeId !== sealed.from) return null;
     const connection = this.connections.get(nodeId);
     if (!connection || connection.inToken !== token) return null;
+    if (this.peers.get(nodeId)?.publicKey !== sealed.pub) return null;
     // No idle expiry on purpose: a link that nobody uses for an hour is still
     // the link both sides approved. A peer that is gone shows up as a failed
     // request, which is the honest signal.
@@ -1342,6 +1477,7 @@ export class SwarmNode {
           proto: PROTOCOL,
           nodeId: this.identity.nodeId,
           name: this.config.name,
+          pub: this.identity.keys.publicKey,
           port: this.server?.port ?? this.config.port,
           sessionId: this.sessionId,
           accepting: this.accepting(),
@@ -1353,35 +1489,69 @@ export class SwarmNode {
         return;
       }
 
+      // Everything below this line arrives sealed. The headers name the sender
+      // and carry its public key (both public); the token rides inside.
+      let sealed: SealedCall;
+      try {
+        sealed = this.openSealed(req, method, `${url.pathname}${url.search}`, body);
+      } catch (err) {
+        // Refused before the envelope was open, so the answer cannot be sealed:
+        // the caller treats it as unauthenticated.
+        const error = err as TransportError;
+        sendJson(res, error.statusCode ?? 400, { error: error.message });
+        return;
+      }
+      res = new SealedResponse(
+        res,
+        sealed.keys,
+        method,
+        `${url.pathname}${url.search}`,
+        sealed.rid,
+      ) as unknown as import("node:http").ServerResponse;
+      const json = (): unknown => sealed.inner ?? {};
+
       if (method === "POST" && route === `${API_PREFIX}/hello`) {
-        await this.handleHello(body, remoteHost, res);
+        await this.handleHello(json(), remoteHost, res, sealed);
         return;
       }
 
       if (method === "POST" && route === `${API_PREFIX}/approval`) {
-        this.handleApprovalRequest(body, res);
+        this.handleApprovalRequest(json(), res, sealed);
         return;
       }
 
-      if (method === "POST" && route === `${API_PREFIX}/files/offer`) {
-        const connection = this.authorize(req);
+      // Every other route belongs to an established link: a token this node
+      // issued, presented by the very node it was issued to, plus the scope.
+      const link = (scope: Scope | null, rateLimited: boolean): Connection | null => {
+        const connection = this.authorize(sealed);
         if (!connection) {
           sendJson(res, 401, { error: "unknown or expired token" });
-          return;
+          return null;
         }
-        if (!hasScope(connection.grantedToPeer, "files:write")) {
-          sendJson(res, 403, { error: "this connection was not granted the files:write scope" });
-          return;
+        if (scope && !hasScope(connection.grantedToPeer, scope)) {
+          sendJson(res, 403, { error: `this connection was not granted the ${scope} scope` });
+          return null;
         }
-        let parsed: { offerId?: unknown; name?: unknown; size?: unknown; sha256?: unknown };
-        try {
-          parsed = JSON.parse(body.toString("utf-8") || "{}") as typeof parsed;
-        } catch {
-          sendJson(res, 400, { error: "the offer is not valid JSON" });
-          return;
+        if (rateLimited && !this.allowRate(connection)) {
+          sendJson(res, 429, {
+            error: `rate limit reached (${this.config.maxMessagesPerMinute} calls per minute)`,
+          });
+          return null;
         }
+        return connection;
+      };
+
+      if (method === "POST" && route === `${API_PREFIX}/files/offer`) {
+        const connection = link("files:write", true);
+        if (!connection) return;
+        const parsed = (json() ?? {}) as { offerId?: unknown; name?: unknown; size?: unknown; sha256?: unknown };
         const size = Number(parsed.size);
         const sha256 = String(parsed.sha256 ?? "");
+        const remoteOfferId = parsed.offerId;
+        if (!isValidOfferId(remoteOfferId)) {
+          sendJson(res, 400, { error: "the offer id is malformed" });
+          return;
+        }
         if (!Number.isInteger(size) || size < 0 || size > this.config.filesMaxBytes) {
           sendJson(res, 413, {
             error: `the offer is ${size} bytes; this node accepts files up to ${this.config.filesMaxBytes}`,
@@ -1404,12 +1574,16 @@ export class SwarmNode {
         }
 
         const offer = this.files.addIncoming({
-          offerId: typeof parsed.offerId === "string" && parsed.offerId ? parsed.offerId : newOfferId(),
+          remoteOfferId,
           from: { nodeId: connection.nodeId, name: connection.name, host: connection.host, port: connection.port },
           displayName: displayName(parsed.name),
           size,
           sha256,
         });
+        if (!offer) {
+          sendJson(res, 409, { error: "this offer was already made" });
+          return;
+        }
         this.emit({ type: "file-offer", offer });
         if (policy === "auto") {
           // Consent was given by configuration, so the bytes are collected
@@ -1428,17 +1602,15 @@ export class SwarmNode {
       }
 
       if (method === "GET" && route.startsWith(`${API_PREFIX}/files/`)) {
-        const connection = this.authorize(req);
-        if (!connection) {
-          sendJson(res, 401, { error: "unknown or expired token" });
-          return;
+        const connection = link("files:read", false);
+        if (!connection) return;
+        let offerId = "";
+        try {
+          offerId = decodeURIComponent(route.slice(`${API_PREFIX}/files/`.length));
+        } catch {
+          /* a malformed escape is simply no offer */
         }
-        if (!hasScope(connection.grantedToPeer, "files:read")) {
-          sendJson(res, 403, { error: "this connection was not granted the files:read scope" });
-          return;
-        }
-        const offerId = route.slice(`${API_PREFIX}/files/`.length);
-        const offer = this.files.takeOutgoing(offerId);
+        const offer = this.files.takeOutgoing(offerId, connection.nodeId);
         if ("error" in offer) {
           sendJson(res, 404, { error: offer.error });
           return;
@@ -1450,107 +1622,81 @@ export class SwarmNode {
           sendJson(res, 410, { error: "the offered file is no longer readable on this node" });
           return;
         }
-        res.writeHead(200, {
-          "content-type": "application/octet-stream",
-          "content-length": String(bytes.length),
-          "x-swarm-name": encodeURIComponent(offer.displayName),
-          "x-swarm-sha256": offer.sha256,
-        });
+        // The bytes are the sealed payload as they are; the receiver checks
+        // them against the sha256 promised in the offer.
+        res.writeHead(200);
         res.end(bytes);
         return;
       }
 
       if (method === "POST" && route === `${API_PREFIX}/leave`) {
-        const connection = this.authorize(req);
-        if (!connection) {
-          sendJson(res, 401, { error: "unknown or expired token" });
-          return;
-        }
+        const connection = link(null, false);
+        if (!connection) return;
         this.dropConnection(connection.nodeId, "peer left");
         sendJson(res, 200, { ok: true });
         return;
       }
 
       if (method === "POST" && route === `${API_PREFIX}/message`) {
-        const connection = this.authorize(req);
-        if (!connection) {
-          sendJson(res, 401, { error: "unknown or expired token" });
-          return;
-        }
-        if (!hasScope(connection.grantedToPeer, "chat")) {
-          sendJson(res, 403, { error: "this connection was not granted the chat scope" });
-          return;
-        }
-        if (!this.allowRate(connection)) {
-          sendJson(res, 429, {
-            error: `rate limit reached (${this.config.maxMessagesPerMinute} messages per minute)`,
-          });
-          return;
-        }
-        const message = parseMessage(JSON.parse(body.toString("utf-8") || "{}"));
+        const connection = link("chat", true);
+        if (!connection) return;
+        const message = parseMessage(json());
         this.receiveMessage(connection, message);
         sendJson(res, 200, { ok: true });
         return;
       }
 
       if (method === "POST" && route === `${API_PREFIX}/knowledge`) {
-        const connection = this.authorize(req);
-        if (!connection) {
-          sendJson(res, 401, { error: "unknown or expired token" });
-          return;
-        }
         if (!this.config.shareKnowledge) {
           sendJson(res, 403, { error: "shared knowledge is disabled on this node" });
           return;
         }
-        if (!hasScope(connection.grantedToPeer, "knowledge:write")) {
-          sendJson(res, 403, { error: "this connection was not granted the knowledge:write scope" });
-          return;
-        }
-        const entries = parseKnowledgePush(JSON.parse(body.toString("utf-8") || "{}"));
+        const connection = link("knowledge:write", true);
+        if (!connection) return;
+        const entries = parseKnowledgePush(json());
         this.ensureSession();
-        const outcome = this.knowledge?.merge(entries) ?? { added: 0, replaced: 0, ignored: 0 };
-        sendJson(res, 200, outcome);
+        // A peer writes in its own name only; third-party entries reach this
+        // node through the peers it chose to read from.
+        const outcome =
+          this.knowledge?.merge(entries, {
+            selfNodeId: this.identity.nodeId,
+            onlyAuthor: connection.nodeId,
+            via: { nodeId: connection.nodeId, name: connection.name },
+          }) ?? { added: 0, replaced: 0, ignored: 0, ids: [] };
+        sendJson(res, 200, { added: outcome.added, replaced: outcome.replaced, ignored: outcome.ignored });
         return;
       }
 
       if (method === "GET" && route === `${API_PREFIX}/knowledge`) {
-        const connection = this.authorize(req);
-        if (!connection) {
-          sendJson(res, 401, { error: "unknown or expired token" });
-          return;
-        }
         if (!this.config.shareKnowledge) {
           sendJson(res, 403, { error: "shared knowledge is disabled on this node" });
           return;
         }
-        if (!hasScope(connection.grantedToPeer, "knowledge:read")) {
-          sendJson(res, 403, { error: "this connection was not granted the knowledge:read scope" });
-          return;
-        }
+        const connection = link("knowledge:read", false);
+        if (!connection) return;
         this.ensureSession();
-        const since = Number(url.searchParams.get("since") ?? 0);
-        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 100), 1), 200);
-        const entries = (this.knowledge?.since(Number.isFinite(since) ? since : 0) ?? []).slice(
-          -limit,
-        );
-        sendJson(res, 200, { sessionId: this.sessionId, entries });
+        const after = Number(url.searchParams.get("after") ?? 0);
+        const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 100) || 100, 1), 200);
+        const page = this.knowledge?.page(Number.isFinite(after) ? after : 0, limit) ?? {
+          entries: [],
+          next: 0,
+          more: false,
+          epoch: "",
+        };
+        sendJson(res, 200, { sessionId: this.sessionId, ...page });
         return;
       }
 
       if (method === "POST" && route === `${API_PREFIX}/peers`) {
-        const connection = this.authorize(req);
-        if (!connection) {
-          sendJson(res, 401, { error: "unknown or expired token" });
-          return;
-        }
-        if (!hasScope(connection.grantedToPeer, "peers:share")) {
-          sendJson(res, 403, { error: "this connection was not granted the peers:share scope" });
-          return;
-        }
-        const introductions = parseIntroductions(JSON.parse(body.toString("utf-8") || "{}"));
+        const connection = link("peers:share", true);
+        if (!connection) return;
+        const introductions = parseIntroductions(json());
+        let accepted = 0;
         for (const peer of introductions) {
           if (peer.nodeId === this.identity.nodeId) continue;
+          // An introduction is a hint. It never replaces what this node saw or
+          // pinned itself, so it cannot redirect a known peer to another address.
+          if (this.seen.has(peer.nodeId) || this.peers.get(peer.nodeId)) continue;
           this.seen.set(peer.nodeId, {
             ...peer,
             lastSeen: Date.now(),
@@ -1558,8 +1704,9 @@ export class SwarmNode {
             accepting: true,
             via: "direct",
           });
+          accepted += 1;
         }
-        sendJson(res, 200, { accepted: introductions.length });
+        sendJson(res, 200, { accepted });
         return;
       }
 
@@ -1584,13 +1731,20 @@ export class SwarmNode {
   }
 
   private async handleHello(
-    body: Buffer,
+    raw: unknown,
     remoteHost: string,
     res: import("node:http").ServerResponse,
+    sealed: SealedCall,
   ): Promise<void> {
-    const request = parseHello(JSON.parse(body.toString("utf-8") || "{}"));
+    const request = parseHello(raw);
     if (request.from.nodeId === this.identity.nodeId) {
       sendJson(res, 400, { error: "a node cannot connect to itself" });
+      return;
+    }
+    // The node that sealed the envelope is the node that asks; the body cannot
+    // name somebody else.
+    if (request.from.nodeId !== sealed.from) {
+      sendJson(res, 400, { error: "the request names a different node than the one that sealed it" });
       return;
     }
 
@@ -1599,19 +1753,24 @@ export class SwarmNode {
       sendJson(res, 403, { status: "denied", reason: "this peer is banned on this node" });
       return;
     }
+    // openSealed already refused a key that differs from the pinned one, so
+    // "pinned" here means "pinned and presented".
+    const keyVerified = Boolean(known?.publicKey && known.publicKey === sealed.pub);
 
     const from: PeerRef = {
       nodeId: request.from.nodeId,
       name: request.from.name,
+      publicKey: sealed.pub,
       host: remoteHost,
       port: request.port,
     };
 
     // A retry that names its request is answered from that request, never by
-    // opening a second one. Only the holder of the request id can do this.
+    // opening a second one. Only the holder of the request id -- and of the key
+    // the request was made with -- can do this.
     if (request.requestId) {
       const previous = this.incoming.get(request.requestId);
-      if (previous && previous.from.nodeId === from.nodeId) {
+      if (previous && previous.from.nodeId === from.nodeId && previous.from.publicKey === sealed.pub) {
         if (previous.status === "approved" && previous.token) {
           this.completeApproval(previous);
           sendJson(res, 200, {
@@ -1649,6 +1808,7 @@ export class SwarmNode {
     const decision = decideInbound({
       config: this.config,
       known,
+      keyVerified,
       requested: request.scopes,
       activeConnections: this.connections.size,
     });
@@ -1673,7 +1833,8 @@ export class SwarmNode {
         grantedToPeer: decision.scopes,
         direction: "in",
       });
-      this.peers.touch(connection);
+      // The key that proved itself here is the one this link is bound to.
+      this.peers.touch({ ...connection, publicKey: sealed.pub });
       sendJson(res, 200, {
         status: "accepted",
         token,
@@ -1691,6 +1852,7 @@ export class SwarmNode {
     }
 
     // Pending: queue it and let the agent or the user decide.
+    this.pruneRequests();
     const pendingFromHost = [...this.incoming.values()].filter(
       (entry) => entry.from.host === remoteHost && entry.status === "pending",
     );
@@ -1703,7 +1865,8 @@ export class SwarmNode {
     }
 
     const duplicate = [...this.incoming.values()].find(
-      (entry) => entry.from.nodeId === from.nodeId && entry.status === "pending",
+      (entry) =>
+        entry.from.nodeId === from.nodeId && entry.from.publicKey === sealed.pub && entry.status === "pending",
     );
     const requestId = duplicate?.requestId ?? newId("r");
     const incoming: IncomingRequest = {
@@ -1719,7 +1882,11 @@ export class SwarmNode {
       createdAt: Date.now(),
     };
     this.incoming.set(requestId, incoming);
-    this.peers.touch(from);
+    // A stranger is not written to the peer book before anyone decided about
+    // it: that would let any host fill the book (and push real peers out of
+    // the probe list). Only a peer this node already pinned gets its address
+    // refreshed here.
+    if (keyVerified) this.peers.touch(from);
     if (!duplicate) this.emit({ type: "request", request: incoming });
 
     sendJson(res, 200, {
@@ -1731,6 +1898,23 @@ export class SwarmNode {
       name: this.config.name,
       port: this.server?.port ?? this.config.port,
     });
+  }
+
+  /**
+   * Forget decided and expired requests after a while, so a stream of hellos
+   * cannot grow the queue without bound.
+   */
+  private pruneRequests(): void {
+    const now = Date.now();
+    for (const [requestId, request] of this.incoming) {
+      if (request.status === "pending" && now - request.createdAt > REQUEST_TTL_MS) {
+        request.status = "expired";
+        request.reason = "the request was not decided in time";
+      }
+      if (request.status !== "pending" && now - (request.decidedAt ?? request.createdAt) > REQUEST_TTL_MS) {
+        this.incoming.delete(requestId);
+      }
+    }
   }
 
   /**
@@ -1753,12 +1937,21 @@ export class SwarmNode {
     });
   }
 
-  private handleApprovalRequest(body: Buffer, res: import("node:http").ServerResponse): void {
-    const { requestId, nodeId } = parseApproval(JSON.parse(body.toString("utf-8") || "{}"));
+  private handleApprovalRequest(
+    raw: unknown,
+    res: import("node:http").ServerResponse,
+    sealed: SealedCall,
+  ): void {
+    const { requestId, nodeId } = parseApproval(raw);
     const request = this.incoming.get(requestId);
-    // Answer exactly as if the request were unknown: a caller that cannot name
-    // the requesting node learns nothing about who is queued here.
-    if (!request || request.from.nodeId !== nodeId) {
+    // Answer exactly as if the request were unknown: only the node that made
+    // the request, sealing with the key it made it with, may collect a token.
+    if (
+      !request ||
+      request.from.nodeId !== nodeId ||
+      nodeId !== sealed.from ||
+      request.from.publicKey !== sealed.pub
+    ) {
       sendJson(res, 200, { status: "expired", reason: "no such request (any more)" });
       return;
     }
@@ -1777,6 +1970,8 @@ export class SwarmNode {
       token: request.status === "approved" ? request.token : undefined,
       scopes: request.status === "approved" ? request.grantedScopes : undefined,
       sessionId: request.sessionId,
+      nodeId: this.identity.nodeId,
+      name: this.config.name,
       reason: request.reason,
     });
   }
@@ -1869,7 +2064,16 @@ export class SwarmNode {
     request.decidedAt = Date.now();
     request.sessionId = sessionId;
 
-    this.peers.touch(request.from, {
+    const pinned = this.pinKey(request.from, request.from.publicKey);
+    if (!pinned.ok) {
+      throw new Error(pinned.reason);
+    }
+
+    // Same rule as for the link: an address this node dials successfully beats
+    // the one the peer announced in its request.
+    const outbound = this.connections.get(request.from.nodeId);
+    const address = outbound?.outToken ? { host: outbound.host, port: outbound.port } : {};
+    this.peers.touch({ ...request.from, ...address }, {
       scopes: granted,
       // The approval is the decision this link needs. Recording it as trusted
       // and auto-connect is what makes the pair of nodes reconnect on their
@@ -1895,6 +2099,130 @@ export class SwarmNode {
       if (err instanceof Error && err.message.startsWith("Refusing the transfer")) throw err;
       /* an unsupported statfs on this platform must not block transfers */
     }
+  }
+
+  // ------------------------------------------------------------ sealed calls
+
+  /** How this node names itself in a sealed call. */
+  private sealedSelf(): { nodeId: string; publicKey: string } {
+    return { nodeId: this.identity.nodeId, publicKey: this.identity.keys.publicKey };
+  }
+
+  /** Transport keys for one (peer, key) pair, derived once and cached. */
+  private keysFor(nodeId: string, publicKey: string): DirectionKeys {
+    const cacheKey = `${nodeId}|${publicKey}`;
+    const cached = this.keyCache.get(cacheKey);
+    if (cached) return cached;
+    const keys = deriveKeys(this.identity.keys, publicKey, this.identity.nodeId, nodeId);
+    if (this.keyCache.size >= 512) this.keyCache.clear();
+    this.keyCache.set(cacheKey, keys);
+    return keys;
+  }
+
+  /**
+   * The keys for one peer, or null when no key is known for it.
+   *
+   * A pinned key always wins over one that arrived with a beacon or a probe:
+   * those are unauthenticated, and preferring them would let a spoofed beacon
+   * decide which key this node encrypts to.
+   */
+  private keysForPeer(peer: { nodeId: string; publicKey?: string | undefined }): DirectionKeys | null {
+    if (!peer.nodeId) return null;
+    const publicKey = this.peers.get(peer.nodeId)?.publicKey ?? peer.publicKey;
+    if (!publicKey || !isValidPublicKey(publicKey)) return null;
+    return this.keysFor(peer.nodeId, publicKey);
+  }
+
+  /** One sealed call to a peer's endpoint, e.g. call(link, "/message", {...}). */
+  private async call<T = unknown>(
+    peer: { nodeId: string; host: string; port: number; publicKey?: string | undefined },
+    route: string,
+    options: SealedRequestOptions,
+  ): Promise<{ status: number; data: T }> {
+    const keys = this.keysForPeer(peer);
+    // A plain Error, not a TransportError: a missing key is not a dead link and
+    // must not send withLink into a reconnect loop.
+    if (!keys) throw new Error(`no encryption key is known for ${peer.nodeId || `${peer.host}:${peer.port}`}`);
+    return sealedRequest<T>(
+      `${baseUrl(peer.host, peer.port)}${API_PREFIX}${route}`,
+      keys,
+      this.sealedSelf(),
+      peer.nodeId,
+      options,
+    );
+  }
+
+  /**
+   * Open a sealed request, or refuse it.
+   *
+   * Everything except /info has to arrive sealed: the headers name the sender
+   * and carry its public key, and being able to open the body proves the sender
+   * holds the matching private key. A key that differs from the pinned one is
+   * refused before anything else happens, and so is a replayed request.
+   */
+  private openSealed(
+    req: import("node:http").IncomingMessage,
+    method: string,
+    pathWithQuery: string,
+    body: Buffer,
+  ): SealedCall {
+    const header = (name: string): string => {
+      const value = req.headers[name];
+      return (Array.isArray(value) ? value[0] : value ?? "").trim();
+    };
+    const from = header(HEADER_FROM);
+    const pub = header(HEADER_PUB);
+    if (!from || !pub) {
+      throw new TransportError(
+        `this node speaks ${PROTOCOL} and accepts only sealed requests; update pi-swarm on the calling machine`,
+        426,
+      );
+    }
+    if (!/^[A-Za-z0-9._:-]{1,80}$/.test(from)) throw new TransportError("the sender id is malformed", 400);
+    if (from === this.identity.nodeId) throw new TransportError("a node cannot call itself", 400);
+    if (!isValidPublicKey(pub)) throw new TransportError("the sender key is not an X25519 public key", 400);
+
+    const known = this.peers.get(from);
+    if (known?.banned) throw new TransportError("this peer is banned on this node", 403);
+    if (known?.publicKey && known.publicKey !== pub) {
+      throw new TransportError(
+        "this node has a different encryption key pinned for you; if you were reinstalled on purpose, " +
+          "ask the user there to forget this peer (swarm_peers forget) and approve again",
+        409,
+      );
+    }
+
+    const keys = this.keysFor(from, pub);
+    const envelope = openRequest(keys, { method, path: pathWithQuery, from, to: this.identity.nodeId }, body);
+    this.replay.check(from, envelope.rid, envelope.ts);
+    return { keys, token: envelope.token, inner: envelope.body, from, pub, rid: envelope.rid };
+  }
+
+  /**
+   * Record the key of a peer, or confirm it matches what was pinned before.
+   *
+   * The first contact pins the key, the way ssh remembers a host key. A peer
+   * that later presents a different key is not the peer that was approved --
+   * either it was reinstalled, or somebody is in the middle -- and neither case
+   * may be resolved automatically.
+   */
+  private pinKey(peer: PeerRef, publicKey: string | undefined): { ok: true } | { ok: false; reason: string } {
+    if (!publicKey || !isValidPublicKey(publicKey)) {
+      return { ok: false, reason: "the peer did not present a usable encryption key" };
+    }
+    const pinned = this.peers.get(peer.nodeId)?.publicKey;
+    if (!pinned) {
+      this.peers.touch({ ...peer, publicKey });
+      return { ok: true };
+    }
+    if (pinned === publicKey) return { ok: true };
+    return {
+      ok: false,
+      reason:
+        `this peer presents a different encryption key (${fingerprint(publicKey)}) than the one pinned ` +
+        `for it (${fingerprint(pinned)}). If it was reinstalled on purpose, forget it here ` +
+        "(swarm_peers forget) and approve it again.",
+    };
   }
 
   private fileIndexPath(): string {
@@ -1942,31 +2270,11 @@ export class SwarmNode {
     const offerId = newOfferId();
     const sentName = path.basename(absolute);
 
-    const response = await requestJson<{ status?: unknown; offerId?: unknown; reason?: unknown }>(
-      `${baseUrl(connection.host, connection.port)}${API_PREFIX}/files/offer`,
-      {
-        body: { offerId, name: sentName, size: bytes.length, sha256 },
-        token: connection.outToken,
-        timeoutMs: 8000,
-      },
-    );
-
-    const status = typeof response.data?.status === "string" ? response.data.status : "unknown";
-    if (status === "declined") {
-      return {
-        offerId: "",
-        status,
-        reason: typeof response.data?.reason === "string" ? response.data.reason : "declined",
-        peer: connection.name,
-        size: bytes.length,
-        sha256,
-      };
-    }
-
-    const acceptedId = typeof response.data?.offerId === "string" ? response.data.offerId : "";
-    const expiresAt = Date.now() + (options.expiresInSeconds ?? 600) * 1000;
+    // Registered before the offer goes out: a receiver with filesPolicy=auto
+    // collects the bytes right away, possibly before our POST has returned.
+    const expiresAt = Date.now() + Math.min(Math.max(options.expiresInSeconds ?? 600, 10), 3600) * 1000;
     this.files.addOutgoing({
-      offerId: acceptedId || offerId,
+      offerId,
       to: { nodeId: connection.nodeId, name: connection.name, host: connection.host, port: connection.port },
       sourcePath: absolute,
       displayName: sentName,
@@ -1977,10 +2285,38 @@ export class SwarmNode {
       served: false,
     });
 
+    let response: { status: number; data: unknown };
+    try {
+      response = await this.call(connection, "/files/offer", {
+        body: { offerId, name: sentName, size: bytes.length, sha256 },
+        token: connection.outToken,
+        timeoutMs: 8000,
+      });
+    } catch (err) {
+      this.files.dropOutgoing(offerId);
+      throw err;
+    }
+    const responseData = (response.data ?? {}) as { status?: unknown; offerId?: unknown; reason?: unknown };
+
+    const status = typeof responseData.status === "string" ? responseData.status : "unknown";
+    if (status === "declined") {
+      this.files.dropOutgoing(offerId);
+      return {
+        offerId: "",
+        status,
+        reason: typeof responseData.reason === "string" ? responseData.reason : "declined",
+        peer: connection.name,
+        size: bytes.length,
+        sha256,
+      };
+    }
+
+    // The receiver files the offer under its own id; that is the id its user
+    // accepts, so it is the one worth reporting.
     return {
-      offerId: acceptedId || offerId,
+      offerId: isValidOfferId(responseData.offerId) ? responseData.offerId : offerId,
       status,
-      reason: typeof response.data?.reason === "string" ? response.data.reason : "offered",
+      reason: typeof responseData.reason === "string" ? responseData.reason : "offered",
       peer: connection.name,
       size: bytes.length,
       sha256,
@@ -2023,12 +2359,20 @@ export class SwarmNode {
     const temp = this.files.tempPath(offer.from.nodeId, offerId);
     fs.rmSync(temp, { force: true });
 
+    const downloadKeys = this.keysForPeer(connection);
+    if (!downloadKeys) throw new Error(`No encryption key is pinned for ${connection.name}.`);
     let result: { bytes: number; sha256: string };
     try {
-      result = await downloadToFile(
-        `${baseUrl(connection.host, connection.port)}${API_PREFIX}/files/${offerId}`,
+      result = await sealedDownloadToFile(
+        `${baseUrl(connection.host, connection.port)}${API_PREFIX}/files/${encodeURIComponent(offer.remoteOfferId)}`,
+        downloadKeys,
+        this.sealedSelf(),
+        connection.nodeId,
         temp,
-        { token: connection.outToken, maxBytes: Math.min(this.config.filesMaxBytes, Math.max(offer.size, 1)) },
+        {
+          token: connection.outToken,
+          maxBytes: Math.min(this.config.filesMaxBytes, Math.max(offer.size, 1)),
+        },
       );
     } catch (err) {
       fs.rmSync(temp, { force: true });
@@ -2216,7 +2560,7 @@ export class SwarmNode {
       if (!hasScope(link.grantedToMe, "chat")) {
         throw new Error("the peer no longer grants the chat scope to this node");
       }
-      await requestJson(`${baseUrl(link.host, link.port)}${API_PREFIX}/message`, {
+      await this.call(link, "/message", {
         body: { id: newId("m"), text, kind, sessionId: this.sessionId },
         token: link.outToken,
         timeoutMs: 6000,
@@ -2405,7 +2749,7 @@ export class SwarmNode {
     if (!connection.outToken) throw new Error("no outbound token for this peer");
     const batch = entries.slice(-MAX_KNOWLEDGE_ENTRIES_PER_PUSH);
     if (batch.length === 0) return 0;
-    await requestJson(`${baseUrl(connection.host, connection.port)}${API_PREFIX}/knowledge`, {
+    await this.call(connection, "/knowledge", {
       body: { entries: batch },
       token: connection.outToken,
       timeoutMs: 8000,
@@ -2422,24 +2766,54 @@ export class SwarmNode {
     if (!this.knowledge) return outcome;
 
     if (hasScope(connection.grantedToMe, "knowledge:read")) {
-      const since = options.full ? 0 : (this.pullSince.get(nodeId) ?? 0);
+      const cursor = options.full ? undefined : this.pullSince.get(nodeId);
+      const board = this.knowledge;
       const result = await this.withLink(connection, async (link) => {
         if (!hasScope(link.grantedToMe, "knowledge:read")) {
           throw new Error("the peer no longer grants knowledge:read");
         }
-        const response = await requestJson<{ entries?: unknown }>(
-          `${baseUrl(link.host, link.port)}${API_PREFIX}/knowledge?since=${since}&limit=100`,
-          { token: link.outToken, timeoutMs: 5000 },
-        );
-        return (Array.isArray(response.data?.entries) ? response.data.entries : []) as KnowledgeEntry[];
+        // Page through everything stored on the peer after our cursor. The
+        // cursor is the peer's own store order, so nothing is skipped when
+        // more than one page is new or when an entry was relayed late.
+        let epoch = cursor?.epoch ?? "";
+        let after = cursor?.seq ?? 0;
+        const accepted: KnowledgeEntry[] = [];
+        let restarted = false;
+        for (let page = 0; page < 20; page += 1) {
+          const response = await this.call(link, `/knowledge?after=${after}&limit=100`, {
+            method: "GET",
+            token: link.outToken,
+            timeoutMs: 5000,
+          });
+          const data = parseKnowledgePage(response.data);
+          if (epoch && data.epoch && data.epoch !== epoch && !restarted) {
+            // The peer's board was recreated: our cursor means nothing there.
+            restarted = true;
+            epoch = data.epoch;
+            after = 0;
+            page = -1;
+            continue;
+          }
+          epoch = data.epoch || epoch;
+          const merged = board.merge(data.entries, {
+            selfNodeId: this.identity.nodeId,
+            via: { nodeId: link.nodeId, name: link.name },
+          });
+          for (const id of merged.ids) {
+            const stored = board.get(id);
+            if (stored) accepted.push(stored);
+          }
+          after = Math.max(after, data.next);
+          if (!data.more || data.entries.length === 0) break;
+        }
+        return { epoch, after, accepted };
       });
       if (result.ok) {
-        const merged = this.knowledge.merge(result.value);
-        outcome.pulled = merged.added + merged.replaced;
-        const newest = result.value.reduce((max, entry) => Math.max(max, Number(entry.ts) || 0), since);
-        this.pullSince.set(nodeId, newest);
-        if (outcome.pulled > 0) {
-          this.emit({ type: "knowledge", entries: this.knowledge.since(since), from: result.link });
+        this.pullSince.set(nodeId, { epoch: result.value.epoch, seq: result.value.after });
+        const fresh = result.value.accepted.filter((entry, index, all) => all.indexOf(entry) === index);
+        outcome.pulled = fresh.length;
+        if (fresh.length > 0) {
+          this.emit({ type: "knowledge", entries: fresh, from: result.link });
         }
       } else {
         outcome.errors.push(`${connection.name}: ${result.error}`);
@@ -2482,6 +2856,7 @@ export class SwarmNode {
     return {
       nodeId: this.identity.nodeId,
       name: this.config.name,
+      fingerprint: fingerprint(this.identity.keys.publicKey),
       instance: instanceSlug(),
       running: this.running,
       port: this.server?.port ?? null,

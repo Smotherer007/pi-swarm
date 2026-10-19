@@ -88,7 +88,7 @@ describe("Discovery", () => {
     fs.writeFileSync(
       path.join(dir, "n_dead.json"),
       JSON.stringify({
-        proto: "pi-swarm/1",
+        proto: "pi-swarm/2",
         nodeId: "n_dead",
         name: "ghost",
         port: 4444,

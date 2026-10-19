@@ -11,16 +11,10 @@ import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import { formatAttempts, formatPeerList } from "../formatting/formatters.ts";
+import { scopeSchema } from "./schema.ts";
 import { runtime } from "../runtime.ts";
 import type { Scope } from "../types.ts";
 
-const scopeLiterals = [
-  Type.Literal("chat"),
-  Type.Literal("knowledge:read"),
-  Type.Literal("knowledge:write"),
-  Type.Literal("peers:share"),
-  Type.Literal("session:invite"),
-];
 
 export const SwarmBroadcastTool: ToolDefinition = {
   name: "swarm_broadcast",
@@ -41,7 +35,7 @@ export const SwarmBroadcastTool: ToolDefinition = {
       }),
     ),
     scopes: Type.Optional(
-      Type.Array(Type.Union(scopeLiterals), {
+      Type.Array(scopeSchema, {
         description: "mode=connect: scopes to request from everyone. Default: the configured default scopes.",
       }),
     ),

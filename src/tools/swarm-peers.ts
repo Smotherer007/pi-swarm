@@ -10,16 +10,11 @@ import { Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import { describeScopes } from "../permissions.ts";
+import { keyLabel } from "../formatting/formatters.ts";
+import { scopeSchema } from "./schema.ts";
+import { confirmWithUser } from "./confirm.ts";
 import { runtime } from "../runtime.ts";
 import type { Scope } from "../types.ts";
-
-const scopeLiterals = [
-  Type.Literal("chat"),
-  Type.Literal("knowledge:read"),
-  Type.Literal("knowledge:write"),
-  Type.Literal("peers:share"),
-  Type.Literal("session:invite"),
-];
 
 const ACTIONS = [
   "list",
@@ -41,7 +36,7 @@ export const SwarmPeersTool: ToolDefinition = {
   name: "swarm_peers",
   label: "Swarm Peers",
   description:
-    "Manage the peers this node knows: list them with trust, auto-connect, ban state and stored scopes; mark a peer trusted (may be auto-approved within its scopes); enable auto-connect for it (connect automatically when its beacon appears); ban it (never answer, drop existing link); unban, or forget it entirely. Changes persist across sessions.",
+    "Manage the peers this node knows: list them with trust, auto-connect, ban state, stored scopes and the pinned key fingerprint; mark a peer trusted (may be auto-approved within its scopes); enable auto-connect for it (connect automatically when its beacon appears); ban it (never answer, drop existing link); unban, or forget it entirely. Changes persist across sessions.",
   parameters: Type.Object({
     action: Type.Union(ACTIONS.map((action) => Type.Literal(action)), {
       description:
@@ -49,7 +44,7 @@ export const SwarmPeersTool: ToolDefinition = {
     }),
     peer: Type.Optional(Type.String({ description: "Peer name, node id, or host:port." })),
     scopes: Type.Optional(
-      Type.Array(Type.Union(scopeLiterals), {
+      Type.Array(scopeSchema, {
         description: "On scopes: what this peer may use when it connects to this node.",
       }),
     ),
@@ -93,6 +88,7 @@ export const SwarmPeersTool: ToolDefinition = {
         lines.push(
           `- ${peer.name} (${peer.host}:${peer.port}) ${peer.nodeId}`,
           `  ${flags.join(", ") || "known"}; it may use here: ${describeScopes(peer.scopes)}`,
+          `  key: ${peer.publicKey ? keyLabel(peer.publicKey) : "not pinned yet (pinned on the next approval or handshake)"}`,
           `  last seen ${peer.lastSeen ? new Date(peer.lastSeen).toISOString() : "never"}${peer.note ? `; note: ${peer.note}` : ""}`,
         );
       }
@@ -114,6 +110,26 @@ export const SwarmPeersTool: ToolDefinition = {
     if (!nodeId) {
       throw new Error(`"${params.peer}" is an address, not a peer this node has heard of yet. Connect first.`);
     }
+    const widening: Partial<Record<PeerAction, string>> = {
+      trust: "trust it: its connect requests are then approved without asking, within its stored scopes",
+      "auto-connect": "connect to it automatically whenever its beacon appears",
+      unban: "lift its ban",
+      scopes: `let it use: ${describeScopes(params.scopes ?? [])}`,
+    };
+    const what = widening[action];
+    if (what) {
+      const pinned = node.peers.get(nodeId)?.publicKey;
+      await confirmWithUser(
+        ctx,
+        `Change what ${resolved.name} may do?`,
+        [
+          `${resolved.name} (node ${nodeId})`,
+          `Key fingerprint: ${pinned ? keyLabel(pinned) : "not pinned yet"}`,
+          `This would ${what}.`,
+        ].join("\n"),
+      );
+    }
+
     const known = node.peers.get(nodeId);
     if (!known) {
       // Make the peer known so there is something to act on.

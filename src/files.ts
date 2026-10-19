@@ -26,7 +26,10 @@ import { FILE_OFFER_TTL_MS, MAX_FILE_BYTES_PER_PEER } from "./types.ts";
 import type { PeerRef } from "./types.ts";
 
 export interface IncomingOffer {
+  /** Local id, generated here: the only thing that ever becomes part of a path. */
   offerId: string;
+  /** The id the sender serves the bytes under. Validated, never used as a path. */
+  remoteOfferId: string;
   from: PeerRef;
   /** What the sender calls it. Display only, never used as a path. */
   displayName: string;
@@ -38,6 +41,7 @@ export interface IncomingOffer {
   /** Set once the bytes are stored. */
   storedPath?: string;
   receivedBytes?: number;
+  receivedAt?: number;
 }
 
 export interface OutgoingOffer {
@@ -76,6 +80,11 @@ export function newOfferId(): string {
   return `f_${crypto.randomBytes(12).toString("hex")}`;
 }
 
+/** The only shape an offer id may have: what newOfferId produces. */
+export function isValidOfferId(value: unknown): value is string {
+  return typeof value === "string" && /^f_[a-f0-9]{24}$/.test(value);
+}
+
 export class FileStore {
   private readonly root: string;
   private readonly maxPerPeer: number;
@@ -101,11 +110,25 @@ export class FileStore {
 
   /** Where the bytes of a transfer are written: named after the id, not the name. */
   targetPath(nodeId: string, offerId: string): string {
-    return path.join(this.peerDir(nodeId), `${offerId}.bin`);
+    return this.insidePeerDir(nodeId, `${offerId}.bin`, offerId);
   }
 
   tempPath(nodeId: string, offerId: string): string {
-    return path.join(this.peerDir(nodeId), `${offerId}.part`);
+    return this.insidePeerDir(nodeId, `${offerId}.part`, offerId);
+  }
+
+  /**
+   * Defence in depth: an id is checked for its shape, and the joined path must
+   * still lie inside the peer directory. Neither can fail for a local id.
+   */
+  private insidePeerDir(nodeId: string, fileName: string, offerId: string): string {
+    if (!isValidOfferId(offerId)) throw new Error(`"${offerId}" is not a valid offer id.`);
+    const dir = this.peerDir(nodeId);
+    const target = path.resolve(dir, fileName);
+    if (path.dirname(target) !== path.resolve(dir)) {
+      throw new Error("refusing a transfer path outside the peer directory");
+    }
+    return target;
   }
 
   /** Bytes already stored for one peer, for the quota. */
@@ -130,10 +153,24 @@ export class FileStore {
     return this.usedBytes(nodeId) + incomingBytes > this.maxPerPeer;
   }
 
-  addIncoming(offer: Omit<IncomingOffer, "createdAt" | "expiresAt" | "status">): IncomingOffer {
+  /**
+   * Record an offer a peer made. The local id is generated here, so a peer
+   * cannot pick a path, and cannot overwrite another peer's offer by reusing
+   * its id. A repeated offer (same sender, same remote id) returns null.
+   */
+  addIncoming(
+    offer: Omit<IncomingOffer, "offerId" | "createdAt" | "expiresAt" | "status">,
+  ): IncomingOffer | null {
+    if (!isValidOfferId(offer.remoteOfferId)) return null;
+    for (const existing of this.incoming.values()) {
+      if (existing.from.nodeId === offer.from.nodeId && existing.remoteOfferId === offer.remoteOfferId) {
+        return null;
+      }
+    }
     const now = Date.now();
     const entry: IncomingOffer = {
       ...offer,
+      offerId: newOfferId(),
       createdAt: now,
       expiresAt: now + FILE_OFFER_TTL_MS,
       status: "pending",
@@ -176,6 +213,7 @@ export class FileStore {
     offer.status = "accepted";
     offer.storedPath = stored.storedPath;
     offer.receivedBytes = stored.receivedBytes;
+    offer.receivedAt = Date.now();
     return offer;
   }
 
@@ -190,9 +228,11 @@ export class FileStore {
    * Single use is the point: an offer that stays collectable becomes a file
    * server, and a file server becomes the browsing nobody wanted.
    */
-  takeOutgoing(offerId: string): OutgoingOffer | { error: string } {
+  takeOutgoing(offerId: string, requesterNodeId: string): OutgoingOffer | { error: string } {
     const offer = this.outgoing.get(offerId);
-    if (!offer) return { error: "no such offer on this node" };
+    // An offer made to someone else is answered exactly like a missing one, and
+    // is not used up by the attempt.
+    if (!offer || offer.to.nodeId !== requesterNodeId) return { error: "no such offer on this node" };
     if (offer.served) return { error: "this offer was already collected" };
     if (Date.now() > offer.expiresAt) {
       this.outgoing.delete(offerId);
@@ -201,6 +241,11 @@ export class FileStore {
     offer.served = true;
     this.outgoing.delete(offerId);
     return offer;
+  }
+
+  /** Withdraw an offer that was refused or never reached the peer. */
+  dropOutgoing(offerId: string): boolean {
+    return this.outgoing.delete(offerId);
   }
 
   outgoingOffers(): OutgoingOffer[] {
@@ -218,7 +263,7 @@ export class FileStore {
         displayName: offer.displayName,
         size: offer.receivedBytes ?? offer.size,
         sha256: offer.sha256,
-        receivedAt: offer.expiresAt - FILE_OFFER_TTL_MS,
+        receivedAt: offer.receivedAt ?? offer.createdAt,
         storedPath: offer.storedPath,
       });
     }
@@ -257,7 +302,7 @@ export class FileStore {
    * Returns what it removed so the caller can log it: silence is what makes a
    * directory grow unnoticed.
    */
-  sweep(retentionDays: number, dirRoot = this.root): { removed: Array<{ displayName: string; path: string }> } {
+  sweep(retentionDays: number): { removed: Array<{ displayName: string; path: string }> } {
     const removed: Array<{ displayName: string; path: string }> = [];
     if (retentionDays <= 0) return { removed };
     const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
@@ -279,7 +324,29 @@ export class FileStore {
       this.incoming.delete(offerId);
       removed.push({ displayName: offer.displayName, path: offer.storedPath });
     }
-    void dirRoot;
+    // A crash mid-download leaves a .part behind; nothing refers to it any more.
+    try {
+      for (const peer of fs.readdirSync(this.root)) {
+        const dir = path.join(this.root, peer);
+        let names: string[] = [];
+        try {
+          names = fs.readdirSync(dir);
+        } catch {
+          continue;
+        }
+        for (const name of names) {
+          if (!name.endsWith(".part")) continue;
+          const file = path.join(dir, name);
+          try {
+            if (fs.statSync(file).mtimeMs < Date.now() - 60 * 60 * 1000) fs.rmSync(file, { force: true });
+          } catch {
+            /* in use or already gone */
+          }
+        }
+      }
+    } catch {
+      /* no files directory yet */
+    }
     return { removed };
   }
 
@@ -311,8 +378,10 @@ export class FileStore {
         const file = item as Partial<ReceivedFile>;
         if (typeof file.offerId !== "string" || typeof file.storedPath !== "string") continue;
         if (!fs.existsSync(file.storedPath)) continue;
+        if (!isValidOfferId(file.offerId)) continue;
         this.incoming.set(file.offerId, {
           offerId: file.offerId,
+          remoteOfferId: file.offerId,
           from: {
             nodeId: String(file.fromNodeId ?? ""),
             name: String(file.fromName ?? "unknown"),
@@ -327,6 +396,7 @@ export class FileStore {
           status: "accepted",
           storedPath: file.storedPath,
           receivedBytes: Number(file.size ?? 0),
+          receivedAt: Number(file.receivedAt ?? Date.now()),
         });
       }
     } catch {

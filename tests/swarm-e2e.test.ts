@@ -15,7 +15,7 @@ import type { SwarmEvent } from "../src/swarm.ts";
 import { baseUrl, requestJson } from "../src/transport.ts";
 import { API_PREFIX } from "../src/types.ts";
 import type { Scope } from "../src/types.ts";
-import { makeConfig, makeIdentity, rmrf, tempDir, waitFor } from "./helpers.ts";
+import { makeConfig, makeIdentity, pubOf, rmrf, sealedCallAs, tempDir, waitFor } from "./helpers.ts";
 
 const dirs: string[] = [];
 const nodes: SwarmNode[] = [];
@@ -50,7 +50,7 @@ describe("swarm over the wire", () => {
     const response = await requestJson<Record<string, unknown>>(
       `${baseUrl("127.0.0.1", started.port)}${API_PREFIX}/info`,
     );
-    assert.equal(response.data.proto, "pi-swarm/1");
+    assert.equal(response.data.proto, "pi-swarm/2");
     assert.equal(response.data.name, "info");
     assert.equal(response.data.nodeId, "n_test_info");
     assert.equal(response.data.accepting, true);
@@ -61,11 +61,26 @@ describe("swarm over the wire", () => {
     const node = makeNode("badtoken");
     const started = await node.start();
     await assert.rejects(
+      sealedCallAs(
+        makeIdentity("stranger-with-a-key"),
+        { nodeId: node.identity.nodeId, publicKey: node.identity.keys.publicKey, port: started.port },
+        "/message",
+        { body: { text: "hello" }, token: "not-a-real-token" },
+      ),
+      /unknown or expired token/,
+    );
+  });
+
+  it("refuses an unsealed call with a clear upgrade hint", async () => {
+    const node = makeNode("plaintext");
+    const started = await node.start();
+    await assert.rejects(
       requestJson(`${baseUrl("127.0.0.1", started.port)}${API_PREFIX}/message`, {
         body: { text: "hello" },
-        token: "not-a-real-token",
+        token: "whatever",
       }),
-      /unknown or expired token/,
+      (err: { statusCode?: number; message: string }) =>
+        err.statusCode === 426 && /pi-swarm\/2/.test(err.message),
     );
   });
 
@@ -351,26 +366,31 @@ describe("swarm over the wire", () => {
     const requestId = pending.requestId!;
     host.decide(requestId, true, ["chat"]);
 
-    const poll = (nodeId: string) =>
-      requestJson<{ status?: string; token?: string; reason?: string }>(
-        `${baseUrl("127.0.0.1", h.port)}${API_PREFIX}/approval`,
-        { body: { requestId, nodeId } },
-      );
+    const target = { nodeId: host.identity.nodeId, publicKey: host.identity.keys.publicKey, port: h.port };
+    const poll = (caller: ReturnType<typeof makeIdentity>, nodeId: string) =>
+      sealedCallAs(caller, target, "/approval", { body: { requestId, nodeId } });
 
     // A stranger holding the request id learns nothing and gets no token.
-    const intruder = await poll("n_test_intruder");
+    const intruder = await poll(makeIdentity("intruder"), "n_test_intruder");
     assert.equal(intruder.data.status, "expired");
     assert.equal(intruder.data.token, undefined);
     assert.equal(host.snapshot().connections.length, 0);
 
+    // Naming the requester is not enough either: the node id is public, but the
+    // approval pinned the key it asked with, and a different key is refused
+    // before the envelope is even opened.
+    const impostor = { ...makeIdentity("collector-impostor"), nodeId: "n_test_collector" };
+    await assert.rejects(poll(impostor, "n_test_collector"), (err: { statusCode?: number }) => err.statusCode === 409);
+
     // The requester itself is answered, and the link exists afterwards.
-    const owner = await poll("n_test_collector");
+    const collector = makeIdentity("collector");
+    const owner = await poll(collector, "n_test_collector");
     assert.equal(owner.data.status, "approved");
     assert.equal(typeof owner.data.token, "string");
     await waitFor(() => host.snapshot().connections.length === 1);
 
     // Polling twice is harmless: same token, one connection.
-    const again = await poll("n_test_collector");
+    const again = await poll(collector, "n_test_collector");
     assert.equal(again.data.token, owner.data.token);
     assert.equal(host.snapshot().connections.length, 1);
 
@@ -430,11 +450,9 @@ describe("an approval is the only decision a link needs", () => {
     });
     await waitFor(() => host.pendingRequests().length === 1);
 
-    // The requester is recorded when it asks, but without any policy: a
-    // request alone must never create an automatically reconnecting peer.
-    const before = host.peers.get("n_test_approved");
-    assert.equal(before?.trusted, false);
-    assert.equal(before?.autoConnect, false);
+    // A request alone writes nothing to the peer book: a stranger becomes
+    // known only by a decision, so nobody can fill the book by asking.
+    assert.equal(host.peers.get("n_test_approved"), undefined);
 
     host.decide(host.pendingRequests()[0].requestId, true, ["chat"]);
     assert.equal((await connecting).status, "connected");
@@ -823,7 +841,7 @@ describe("asking for wider scopes on a live link", () => {
     await guest.start();
 
     host.peers.touch(
-      { nodeId: "n_test_upguest", name: "upguest", host: "127.0.0.1", port: 1 },
+      { nodeId: "n_test_upguest", publicKey: pubOf("upguest"), name: "upguest", host: "127.0.0.1", port: 1 },
       { trusted: true, scopes: ["chat", "knowledge:read", "knowledge:write"] },
     );
 

@@ -20,6 +20,7 @@ import type { SwarmEvent } from "./swarm.ts";
 import { getConfig } from "./config.ts";
 import { describeScopes } from "./permissions.ts";
 import { shortId } from "./protocol.ts";
+import { keyLabel } from "./formatting/formatters.ts";
 
 export class SwarmRuntime {
   private readonly pi: ExtensionAPI;
@@ -99,6 +100,7 @@ export class SwarmRuntime {
           "swarm-request",
           [
             `Connect request from ${who} (${shortId(event.request.from.nodeId)}).`,
+            `Key fingerprint: ${keyLabel(event.request.from.publicKey)} (compare it with the other user before approving a stranger).`,
             `Requested scopes: ${describeScopes(event.request.requestedScopes)}.`,
             `Intent: ${event.request.intent}${event.request.message ? ` -- ${event.request.message}` : ""}`,
             `Queued because: ${event.request.reason}.`,

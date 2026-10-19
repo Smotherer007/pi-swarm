@@ -19,7 +19,13 @@ import type {
 } from "../types.ts";
 import { labelPeerContent, shortId } from "../protocol.ts";
 import { describeScopes } from "../permissions.ts";
+import { fingerprint, isValidPublicKey } from "../crypto.ts";
 import type { SwarmSnapshot } from "../swarm.ts";
+
+/** The fingerprint of a key, or a note that there is none. */
+export function keyLabel(publicKey: string | undefined): string {
+  return isValidPublicKey(publicKey) ? fingerprint(publicKey) : "none presented";
+}
 
 const MAX_SECTION = 6000;
 
@@ -36,6 +42,7 @@ export function formatStatus(snapshot: SwarmSnapshot): string {
   const lines: string[] = [];
   lines.push(
     `Swarm node "${snapshot.name}" (${shortId(snapshot.nodeId)})`,
+    `  key fingerprint: ${snapshot.fingerprint} (read it to the other user when a first contact is approved)`,
   );
 
   if (snapshot.running) {
@@ -193,6 +200,7 @@ export function formatAttempts(attempts: readonly ConnectAttempt[], warnings: re
       `- ${attempt.peer.name} (${attempt.peer.host}:${attempt.peer.port}): ${attempt.status}${scopes}`,
     );
     if (attempt.reason) lines.push(`  ${attempt.reason}`);
+    if (attempt.fingerprint) lines.push(`  key fingerprint ${attempt.fingerprint}`);
     if (attempt.requestId) lines.push(`  request ${attempt.requestId}`);
   }
 
@@ -217,8 +225,9 @@ export function formatRequests(requests: readonly IncomingRequest[]): string {
   for (const request of requests) {
     lines.push(
       `- ${request.requestId}: ${request.from.name} (${request.from.host}:${request.from.port})`,
+      `  key fingerprint: ${keyLabel(request.from.publicKey)} -- compare it with the other user before approving a stranger`,
       `  asks for: ${describeScopes(request.requestedScopes)}`,
-      `  intent: ${request.intent}${request.message ? ` -- ${request.message}` : ""}`,
+      `  intent: ${request.intent}${request.message ? ` -- their words: ${request.message}` : ""}`,
       `  queued because: ${request.reason}, at ${clock(request.createdAt)}`,
       `  decide with swarm_requests approve requestId="${request.requestId}" (optionally scopes=[...]) or deny.`,
     );

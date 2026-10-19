@@ -29,6 +29,12 @@ jobs:
 
       - run: npm ci
 
+      # The release job publishes on every push to main, independent of the CI
+      # workflow; without these steps a red commit would still be released.
+      - run: npm run typecheck
+
+      - run: npm test
+
       - run: npm run build
 
       - name: Release

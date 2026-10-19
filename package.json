@@ -32,6 +32,11 @@
     "typecheck": "tsc --noEmit",
     "test:coverage": "node --experimental-test-coverage --test \"tests/**/*.test.ts\""
   },
+  "files": [
+    "index.ts",
+    "src",
+    "skills"
+  ],
   "peerDependencies": {
     "typebox": "*"
   },

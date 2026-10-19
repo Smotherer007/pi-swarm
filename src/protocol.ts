@@ -17,6 +17,7 @@ import type {
 import {
   KNOWLEDGE_KINDS,
   MAX_KEY_LENGTH,
+  MAX_KNOWLEDGE_ENTRIES_PER_PUSH,
   MAX_KNOWLEDGE_TEXT,
   MAX_TEXT_LENGTH,
   PROTOCOL,
@@ -161,35 +162,74 @@ export function parseMessage(value: unknown): IncomingMessage {
   };
 }
 
+/** Validate one knowledge entry from another node. Throws a ProtocolError. */
+export function parseKnowledgeEntry(item: unknown): KnowledgeEntry {
+  const entry = asRecord(item, "entries[]");
+  const id = asString(entry.id, "entries[].id", 160);
+  const key = asOptionalString(entry.key, "entries[].key", MAX_KEY_LENGTH) ?? "";
+  if (!isKnowledgeKind(entry.kind)) fail("entries[].kind is not a known knowledge kind.");
+  const author = asRecord(entry.author, "entries[].author");
+  const ts = entry.ts;
+  if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) {
+    fail("entries[].ts must be a unix timestamp in ms.");
+  }
+  const authorId = asString(author.nodeId, "entries[].author.nodeId", 80);
+  if (!/^[A-Za-z0-9._:-]+$/.test(authorId)) fail("entries[].author.nodeId has invalid characters.");
+  return {
+    id,
+    sessionId: asOptionalString(entry.sessionId, "entries[].sessionId", 80) ?? "",
+    key,
+    kind: entry.kind,
+    text: asString(entry.text, "entries[].text", MAX_KNOWLEDGE_TEXT),
+    author: {
+      nodeId: authorId,
+      name: asOptionalString(author.name, "entries[].author.name", 64) ?? "unknown",
+    },
+    ts,
+  };
+}
+
+/** A push: every entry must be valid, or the whole batch is refused (400). */
 export function parseKnowledgePush(value: unknown): KnowledgeEntry[] {
   const record = asRecord(value, "body");
   if (!Array.isArray(record.entries)) fail("entries must be an array.");
-  if (record.entries.length === 0) return [];
-  const entries: KnowledgeEntry[] = [];
-  for (const item of record.entries) {
-    const entry = asRecord(item, "entries[]");
-    const id = asString(entry.id, "entries[].id", 160);
-    const key = asOptionalString(entry.key, "entries[].key", MAX_KEY_LENGTH) ?? "";
-    if (!isKnowledgeKind(entry.kind)) fail("entries[].kind is not a known knowledge kind.");
-    const author = asRecord(entry.author, "entries[].author");
-    const ts = entry.ts;
-    if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) {
-      fail("entries[].ts must be a unix timestamp in ms.");
-    }
-    entries.push({
-      id,
-      sessionId: asOptionalString(entry.sessionId, "entries[].sessionId", 80) ?? "",
-      key,
-      kind: entry.kind,
-      text: asString(entry.text, "entries[].text", MAX_KNOWLEDGE_TEXT),
-      author: {
-        nodeId: asString(author.nodeId, "entries[].author.nodeId", 80),
-        name: asOptionalString(author.name, "entries[].author.name", 64) ?? "unknown",
-      },
-      ts,
-    });
+  if (record.entries.length > MAX_KNOWLEDGE_ENTRIES_PER_PUSH) {
+    fail(`at most ${MAX_KNOWLEDGE_ENTRIES_PER_PUSH} entries per push.`);
   }
-  return entries;
+  return record.entries.map((item) => parseKnowledgeEntry(item));
+}
+
+/**
+ * A page pulled from a peer. Lenient on purpose: one malformed entry on the
+ * other side must not stop every later sync, so invalid entries are skipped
+ * and counted instead.
+ */
+export function parseKnowledgePage(value: unknown): {
+  epoch: string;
+  entries: KnowledgeEntry[];
+  skipped: number;
+  next: number;
+  more: boolean;
+} {
+  const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const raw = Array.isArray(record.entries) ? record.entries.slice(0, 200) : [];
+  const entries: KnowledgeEntry[] = [];
+  let skipped = 0;
+  for (const item of raw) {
+    try {
+      entries.push(parseKnowledgeEntry(item));
+    } catch {
+      skipped += 1;
+    }
+  }
+  const next = Number(record.next);
+  return {
+    epoch: typeof record.epoch === "string" ? record.epoch.slice(0, 64) : "",
+    entries,
+    skipped,
+    next: Number.isFinite(next) && next >= 0 ? next : 0,
+    more: record.more === true,
+  };
 }
 
 export function parseIntroductions(value: unknown): PeerRef[] {
